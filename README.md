@@ -1,6 +1,6 @@
 # tweezer
 
-A chat bot framework for Rust. Platform-agnostic core, adapter crates for each platform.
+A chat bot framework for Rust, primarily for livestreams.
 
 ## crates
 
