@@ -2,6 +2,10 @@
 name = "tweezer"
 version = "0.1.0"
 edition = "2024"
+description = "A pluggable bot framework for live streaming platforms"
+license = "MIT"
+repository = "https://github.com/espeon/tweezer"
+readme = "../README.md"
 
 [dependencies]
 async-trait = "0.1"

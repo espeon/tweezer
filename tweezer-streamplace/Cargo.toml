@@ -2,6 +2,10 @@
 name = "tweezer-streamplace"
 version = "0.1.0"
 edition = "2024"
+description = "Streamplace adapter for the tweezer bot framework"
+license = "MIT"
+repository = "https://github.com/espeon/tweezer"
+readme = "../README.md"
 
 [dependencies]
 anyhow = "1"
