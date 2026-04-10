@@ -9,7 +9,7 @@ use crate::{typemap::TypeMap, OutgoingMessage, TweezerError, User};
 pub enum TriggerKind {
     Raid {
         from_channel: String,
-        viewer_count: u32,
+        viewer_count: Option<u32>,
     },
     Follow {
         user: User,
@@ -162,7 +162,7 @@ mod tests {
     fn trigger_context_accessors() {
         let kind = TriggerKind::Raid {
             from_channel: "friend".into(),
-            viewer_count: 10,
+            viewer_count: Some(10),
         };
         let (ctx, _) = make_trigger_ctx(kind);
         assert_eq!(ctx.platform(), "test");
@@ -185,7 +185,7 @@ mod tests {
     fn trigger_context_clone() {
         let kind = TriggerKind::Raid {
             from_channel: "friend".into(),
-            viewer_count: 5,
+            viewer_count: Some(5),
         };
         let (ctx, _) = make_trigger_ctx(kind);
         let ctx2 = ctx.clone();

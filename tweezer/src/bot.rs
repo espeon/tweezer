@@ -1272,7 +1272,7 @@ mod tests {
         let (reply_tx, _) = mpsc::channel(1);
         let kind = TriggerKind::Raid {
             from_channel: "friend".into(),
-            viewer_count: 10,
+            viewer_count: Some(10),
         };
         run_with_events(bot, vec![make_trigger(kind, reply_tx)]).await;
         assert!(*fired.lock().unwrap());
@@ -1326,7 +1326,7 @@ mod tests {
                 make_trigger(
                     TriggerKind::Raid {
                         from_channel: "friend".into(),
-                        viewer_count: 5,
+                        viewer_count: Some(5),
                     },
                     tx1,
                 ),
@@ -1354,7 +1354,7 @@ mod tests {
         let (reply_tx, mut reply_rx) = mpsc::channel(1);
         let kind = TriggerKind::Raid {
             from_channel: "friend".into(),
-            viewer_count: 10,
+            viewer_count: Some(10),
         };
         run_with_events(bot, vec![make_trigger(kind, reply_tx)]).await;
 

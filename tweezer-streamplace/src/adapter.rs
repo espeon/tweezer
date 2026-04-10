@@ -21,6 +21,7 @@ use crate::xrpc::{OutgoingFacet, UserCache, XrpcClient, resolve_pds};
 
 const COLLECTION: &str = "place.stream.chat.message";
 const FOLLOW_COLLECTION: &str = "app.bsky.graph.follow";
+const TELEPORT_COLLECTION: &str = "place.stream.live.teleport";
 
 #[derive(Deserialize)]
 struct Facet {
@@ -227,6 +228,7 @@ impl Adapter for StreamplaceAdapter {
             .wanted_collections(vec![
                 COLLECTION.to_string(),
                 FOLLOW_COLLECTION.to_string(),
+                TELEPORT_COLLECTION.to_string(),
             ])
             .build();
 
@@ -242,6 +244,13 @@ impl Adapter for StreamplaceAdapter {
             user_cache: UserCache::new(),
         });
 
+        let teleport_shared = Arc::new(SharedState {
+            bot_tx: bot.clone(),
+            streamers: self.streamers.clone(),
+            xrpc: xrpc.clone(),
+            user_cache: UserCache::new(),
+        });
+
         let mut ingestors = Ingestors::new();
         ingestors.commits.insert(
             COLLECTION.to_string(),
@@ -250,6 +259,10 @@ impl Adapter for StreamplaceAdapter {
         ingestors.commits.insert(
             FOLLOW_COLLECTION.to_string(),
             Box::new(FollowIngestor { shared: follow_shared }),
+        );
+        ingestors.commits.insert(
+            TELEPORT_COLLECTION.to_string(),
+            Box::new(TeleportIngestor { shared: teleport_shared }),
         );
 
         let c_cursor = cursor.clone();
@@ -442,6 +455,61 @@ impl LexiconIngestor for FollowIngestor {
                         id: follower_did,
                         display_name,
                     },
+                },
+                reply_tx,
+                Arc::new(|name| format!(":{}:", name)),
+            ),
+        );
+
+        self.shared.bot_tx.send(event).await.ok();
+
+        Ok(())
+    }
+}
+
+struct TeleportIngestor {
+    shared: Arc<SharedState>,
+}
+
+#[async_trait]
+impl LexiconIngestor for TeleportIngestor {
+    async fn ingest(&self, message: Event<serde_json::Value>) -> anyhow::Result<()> {
+        let commit = match &message.commit {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+
+        if !matches!(commit.operation, Operation::Create) {
+            return Ok(());
+        }
+
+        let record = match &commit.record {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+
+        let streamer = match record.get("streamer").and_then(|v| v.as_str()) {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+
+        if !self.shared.streamers.contains(streamer) {
+            return Ok(());
+        }
+
+        let raider_did = message.did.clone();
+        let _display_name = self.shared.user_cache.resolve_handle(&raider_did).await;
+        info!(raider = %raider_did, streamer, "teleport/raid event");
+
+        let (reply_tx, _) = mpsc::channel::<OutgoingMessage>(1);
+
+        let event = tweezer::Event::Trigger(
+            TriggerEvent::new(
+                "streamplace",
+                streamer,
+                TriggerKind::Raid {
+                    from_channel: raider_did.clone(),
+                    viewer_count: None,
                 },
                 reply_tx,
                 Arc::new(|name| format!(":{}:", name)),

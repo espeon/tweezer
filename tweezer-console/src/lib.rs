@@ -186,9 +186,8 @@ fn parse_trigger(
         "raid" => TriggerKind::Raid {
             from_channel: get("from")?,
             viewer_count: get("viewers")
-                .unwrap_or_else(|_| "0".into())
-                .parse()
-                .unwrap_or(0),
+                .ok()
+                .and_then(|v| v.parse().ok()),
         },
         "follow" => TriggerKind::Follow { user: user_from_args(&args) },
         "sub" => TriggerKind::Subscription {
@@ -287,7 +286,7 @@ mod tests {
             Event::Trigger(te) => match te.kind() {
                 TriggerKind::Raid { from_channel, viewer_count } => {
                     assert_eq!(from_channel, "Friend");
-                    assert_eq!(*viewer_count, 42);
+                    assert_eq!(*viewer_count, Some(42));
                 }
                 other => panic!("expected Raid, got {:?}", other),
             },
