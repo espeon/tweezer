@@ -1,0 +1,3 @@
+[workspace]
+members = ["tweezer", "tweezer-console", "tweezer-streamplace", "tweezer-example-bot"]
+resolver = "2"
