@@ -4,10 +4,10 @@ A chat bot framework for Rust. Platform-agnostic core, adapter crates for each p
 
 ## crates
 
-- `tweezer` -- bot runtime, handler registration, event types
-- `tweezer-console` -- stdin/stdout adapter for testing
-- `tweezer-streamplace` -- [Streamplace](https://stream.place) adapter (Jetstream)
-- `tweezer-example-bot` -- working example
+- `tweezer`: bot runtime, handler registration, event types
+- `tweezer-console`: stdin/stdout adapter for testing
+- `tweezer-streamplace`: [Streamplace](https://stream.place) adapter (Jetstream)
+- `tweezer-example-bot`: working example
 
 ## quick start
 
@@ -156,7 +156,7 @@ use tweezer_streamplace::StreamplaceAdapter;
 
 let mut adapter = StreamplaceAdapter::new(
     "wss://jetstream.firehose.cam",
-    "bot@example.com",  // handle or DID -- PDS resolved automatically
+    "mycool.bot",  // handle or DID
     "password",
 );
 adapter.add_streamer("did:plc:streamer-a");
@@ -201,12 +201,13 @@ impl Adapter for MyAdapter {
         });
         Ok(())
     }
+    //...
 }
 ```
 
 ## stream overlay
 
-Forward chat messages to a WebSocket so a browser overlay can display them:
+Use tweezer to forward chat messages to a WebSocket so a browser overlay can display them:
 
 ```rust
 use tokio::sync::broadcast;
@@ -244,9 +245,3 @@ let overlay = async move {
 };
 tokio::spawn(overlay);
 ```
-
-Connect from a browser with `new WebSocket("ws://localhost:9123")` and parse the JSON.
-
-## license
-
-MIT
