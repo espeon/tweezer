@@ -72,6 +72,8 @@ impl CooldownState {
     }
 }
 
+type CheckFn = Arc<dyn Fn(&Context) -> bool + Send + Sync>;
+
 struct CommandEntry {
     handler: Handler,
     description: Option<String>,
@@ -79,6 +81,7 @@ struct CommandEntry {
     #[allow(dead_code)]
     platform: Option<String>,
     cooldown: Arc<CooldownState>,
+    checks: Vec<CheckFn>,
 }
 
 #[derive(Clone)]
@@ -97,6 +100,7 @@ pub struct Command<F, Fut> {
     platform: Option<String>,
     cooldown: Option<Duration>,
     user_cooldown: Option<Duration>,
+    checks: Vec<CheckFn>,
     _phantom: PhantomData<Fut>,
 }
 
@@ -115,6 +119,7 @@ where
             platform: None,
             cooldown: None,
             user_cooldown: None,
+            checks: Vec::new(),
             _phantom: PhantomData,
         }
     }
@@ -146,6 +151,11 @@ where
 
     pub fn user_cooldown(mut self, duration: Duration) -> Self {
         self.user_cooldown = Some(duration);
+        self
+    }
+
+    pub fn check(mut self, f: impl Fn(&Context) -> bool + Send + Sync + 'static) -> Self {
+        self.checks.push(Arc::new(f));
         self
     }
 }
@@ -366,6 +376,7 @@ impl Bot {
             category: cmd.category,
             platform: cmd.platform.clone(),
             cooldown: Arc::new(CooldownState::new(cmd.cooldown, cmd.user_cooldown)),
+            checks: cmd.checks,
         };
         match (cmd.channel, cmd.platform) {
             (Some(ch), _) => {
@@ -843,19 +854,41 @@ impl Bot {
                     // Lookup priority: channel-specific -> platform-specific -> global
                     let entry = channel_commands
                         .get(&(ctx.channel().to_string(), cmd.clone()))
-                        .map(|e| (e.handler.clone(), e.cooldown.clone()))
                         .or_else(|| {
                             platform_commands
                                 .get(&(ctx.platform().to_string(), cmd.clone()))
-                                .map(|e| (e.handler.clone(), e.cooldown.clone()))
                         })
                         .or_else(|| {
-                            commands.get(&cmd).map(|e| (e.handler.clone(), e.cooldown.clone()))
+                            commands.get(&cmd)
                         });
-                    if let Some((handler, cooldown)) = entry {
-                        if !cooldown.check_and_mark(&ctx.user.id) {
+                    if let Some(entry) = entry {
+                        if !entry.checks.iter().all(|c| c(&ctx)) {
+                            if let Some(unrecognized_hook) = unrecognized_command_hook {
+                                let unrecognized_hook = unrecognized_hook.clone();
+                                let ctx = ctx.with_args(args);
+                                let hook = error_hook.clone();
+                                let sem = semaphore.clone();
+                                let cmd_name = cmd.clone();
+                                join_set.spawn(async move {
+                                    let _permit = sem.acquire().await.unwrap();
+                                    let platform = ctx.platform().to_string();
+                                    let channel = ctx.channel().to_string();
+                                    if let Err(e) = unrecognized_hook(ctx, cmd_name).await {
+                                        hook(HandlerError {
+                                            kind: HandlerErrorKind::UnrecognizedCommand,
+                                            platform,
+                                            channel,
+                                            error: e,
+                                        });
+                                    }
+                                });
+                            }
                             return;
                         }
+                        if !entry.cooldown.check_and_mark(&ctx.user.id) {
+                            return;
+                        }
+                        let handler = entry.handler.clone();
                         let ctx = ctx.with_args(args);
 
                         if let Some(before_hook) = before_command_hook {
@@ -1765,6 +1798,144 @@ mod tests {
         let (reply_tx, _) = mpsc::channel(1);
         run_with_events(bot, vec![make_message("!nope a b c", reply_tx)]).await;
         assert_eq!(*got_args.lock().unwrap(), vec!["a", "b", "c"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Command check tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn check_passing_allows_command() {
+        let fired = Arc::new(Mutex::new(false));
+        let f = fired.clone();
+
+        let mut bot = Bot::new();
+        bot.add_command(
+            Command::new("ping", move |_ctx| {
+                let f = f.clone();
+                async move {
+                    *f.lock().unwrap() = true;
+                    Ok(())
+                }
+            })
+            .check(|_ctx| true),
+        );
+
+        let (reply_tx, _) = mpsc::channel(1);
+        run_with_events(bot, vec![make_message("!ping", reply_tx)]).await;
+        assert!(*fired.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn check_failing_blocks_command() {
+        let fired = Arc::new(Mutex::new(false));
+        let f = fired.clone();
+
+        let mut bot = Bot::new();
+        bot.add_command(
+            Command::new("ping", move |_ctx| {
+                let f = f.clone();
+                async move {
+                    *f.lock().unwrap() = true;
+                    Ok(())
+                }
+            })
+            .check(|_ctx| false),
+        );
+
+        let (reply_tx, _) = mpsc::channel(1);
+        run_with_events(bot, vec![make_message("!ping", reply_tx)]).await;
+        assert!(!*fired.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn multiple_checks_all_must_pass() {
+        let fired = Arc::new(Mutex::new(false));
+        let f = fired.clone();
+
+        let mut bot = Bot::new();
+        bot.add_command(
+            Command::new("ping", move |_ctx| {
+                let f = f.clone();
+                async move {
+                    *f.lock().unwrap() = true;
+                    Ok(())
+                }
+            })
+            .check(|_ctx| true)
+            .check(|_ctx| false),
+        );
+
+        let (reply_tx, _) = mpsc::channel(1);
+        run_with_events(bot, vec![make_message("!ping", reply_tx)]).await;
+        assert!(!*fired.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn check_failure_triggers_unrecognized_handler() {
+        let got_cmd = Arc::new(Mutex::new(String::new()));
+        let gc = got_cmd.clone();
+
+        let mut bot = Bot::new();
+        bot.add_command(
+            Command::new("admin", |_ctx| async { Ok(()) })
+                .check(|_ctx| false),
+        );
+        bot.on_unrecognized_command(move |_ctx, cmd| {
+            let gc = gc.clone();
+            async move {
+                *gc.lock().unwrap() = cmd;
+                Ok(())
+            }
+        });
+
+        let (reply_tx, _) = mpsc::channel(1);
+        run_with_events(bot, vec![make_message("!admin", reply_tx)]).await;
+        assert_eq!(*got_cmd.lock().unwrap(), "admin");
+    }
+
+    #[tokio::test]
+    async fn check_can_inspect_context() {
+        let fired = Arc::new(Mutex::new(false));
+        let f = fired.clone();
+
+        let mut bot = Bot::new();
+        bot.add_command(
+            Command::new("ping", move |_ctx| {
+                let f = f.clone();
+                async move {
+                    *f.lock().unwrap() = true;
+                    Ok(())
+                }
+            })
+            .check(|ctx| ctx.user().name == "alice"),
+        );
+
+        let (reply_tx, _) = mpsc::channel(1);
+        run_with_events(bot, vec![make_message("!ping", reply_tx)]).await;
+        assert!(*fired.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn check_rejects_wrong_user() {
+        let fired = Arc::new(Mutex::new(false));
+        let f = fired.clone();
+
+        let mut bot = Bot::new();
+        bot.add_command(
+            Command::new("ping", move |_ctx| {
+                let f = f.clone();
+                async move {
+                    *f.lock().unwrap() = true;
+                    Ok(())
+                }
+            })
+            .check(|ctx| ctx.user().name == "bob"),
+        );
+
+        let (reply_tx, _) = mpsc::channel(1);
+        run_with_events(bot, vec![make_message("!ping", reply_tx)]).await;
+        assert!(!*fired.lock().unwrap());
     }
 
     #[tokio::test]
