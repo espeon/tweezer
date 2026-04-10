@@ -354,10 +354,10 @@ async fn main() {
     bot.help_command();
 
     // ---------------------------------------------------------------------------
-    // Dynamic command dispatch (on_message catch-all)
+    // Dynamic command dispatch (on_raw_message catch-all)
     // ---------------------------------------------------------------------------
 
-    bot.on_message(|ctx: Context| async move {
+    bot.on_raw_message(|ctx: Context| async move {
         let dc = ctx
             .state::<DynamicCommands>()
             .expect("DynamicCommands not registered");

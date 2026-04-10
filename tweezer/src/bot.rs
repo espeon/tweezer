@@ -161,7 +161,7 @@ pub struct HandlerError {
 #[derive(Debug)]
 pub enum HandlerErrorKind {
     Command { name: String },
-    Message,
+    RawMessage,
     Trigger,
 }
 
@@ -175,9 +175,9 @@ fn default_error_handler(e: HandlerError) {
                 e.platform, e.channel, name, e.error
             )
         }
-        HandlerErrorKind::Message => {
+        HandlerErrorKind::RawMessage => {
             eprintln!(
-                "[{}/{}] message handler error: {}",
+                "[{}/{}] raw message handler error: {}",
                 e.platform, e.channel, e.error
             )
         }
@@ -250,7 +250,7 @@ pub struct Bot {
     commands: HashMap<String, CommandEntry>,
     channel_commands: HashMap<(String, String), CommandEntry>,
     platform_commands: HashMap<(String, String), CommandEntry>,
-    message_handlers: Vec<Handler>,
+    raw_message_handlers: Vec<Handler>,
     trigger_handlers: Vec<(TriggerMatcher, TriggerHandler)>,
     error_hook: Option<ErrorHook>,
     shutdown_tx: watch::Sender<bool>,
@@ -269,7 +269,7 @@ impl Bot {
             commands: HashMap::new(),
             channel_commands: HashMap::new(),
             platform_commands: HashMap::new(),
-            message_handlers: Vec::new(),
+            raw_message_handlers: Vec::new(),
             trigger_handlers: Vec::new(),
             error_hook: None,
             shutdown_tx,
@@ -562,22 +562,22 @@ impl Bot {
         );
     }
 
-    pub fn on_message<F, Fut>(&mut self, handler: F)
+    pub fn on_raw_message<F, Fut>(&mut self, handler: F)
     where
         F: Fn(Context) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), TweezerError>> + Send + 'static,
     {
-        self.message_handlers
+        self.raw_message_handlers
             .push(Arc::new(move |ctx| Box::pin(handler(ctx))));
     }
 
-    pub fn on_message_for<F, Fut>(&mut self, channel: &str, handler: F)
+    pub fn on_raw_message_for<F, Fut>(&mut self, channel: &str, handler: F)
     where
         F: Fn(Context) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), TweezerError>> + Send + 'static,
     {
         let channel = channel.to_string();
-        self.message_handlers.push(Arc::new(move |ctx| {
+        self.raw_message_handlers.push(Arc::new(move |ctx| {
             if ctx.channel() == channel {
                 Box::pin(handler(ctx))
             } else {
@@ -586,13 +586,13 @@ impl Bot {
         }));
     }
 
-    pub fn on_message_platform<F, Fut>(&mut self, platform: &str, handler: F)
+    pub fn on_raw_message_platform<F, Fut>(&mut self, platform: &str, handler: F)
     where
         F: Fn(Context) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), TweezerError>> + Send + 'static,
     {
         let platform = platform.to_string();
-        self.message_handlers.push(Arc::new(move |ctx| {
+        self.raw_message_handlers.push(Arc::new(move |ctx| {
             if ctx.platform() == platform {
                 Box::pin(handler(ctx))
             } else {
@@ -668,10 +668,10 @@ impl Bot {
         if self.commands.is_empty()
             && self.channel_commands.is_empty()
             && self.platform_commands.is_empty()
-            && self.message_handlers.is_empty()
+            && self.raw_message_handlers.is_empty()
             && self.trigger_handlers.is_empty()
         {
-            warnings.push("no commands, message handlers, or trigger handlers registered".into());
+            warnings.push("no commands, raw message handlers, or trigger handlers registered".into());
         }
 
         if warnings.is_empty() {
@@ -698,7 +698,7 @@ impl Bot {
         let commands = Arc::new(self.commands);
         let channel_commands = Arc::new(self.channel_commands);
         let platform_commands = Arc::new(self.platform_commands);
-        let message_handlers = Arc::new(self.message_handlers);
+        let raw_message_handlers = Arc::new(self.raw_message_handlers);
         let trigger_handlers = Arc::new(self.trigger_handlers);
         let error_hook: Arc<dyn Fn(HandlerError) + Send + Sync> = self
             .error_hook
@@ -716,7 +716,7 @@ impl Bot {
                     match event {
                         Some(event) => Self::dispatch(
                             event, &commands, &channel_commands, &platform_commands,
-                            &message_handlers, &trigger_handlers, &error_hook, command_prefix,
+                            &raw_message_handlers, &trigger_handlers, &error_hook, command_prefix,
                             &semaphore, &state, &mut join_set,
                         ),
                         None => break,
@@ -740,7 +740,7 @@ impl Bot {
         commands: &Arc<HashMap<String, CommandEntry>>,
         channel_commands: &Arc<HashMap<(String, String), CommandEntry>>,
         platform_commands: &Arc<HashMap<(String, String), CommandEntry>>,
-        message_handlers: &Arc<Vec<Handler>>,
+        raw_message_handlers: &Arc<Vec<Handler>>,
         trigger_handlers: &Arc<Vec<(TriggerMatcher, TriggerHandler)>>,
         error_hook: &Arc<dyn Fn(HandlerError) + Send + Sync>,
         command_prefix: char,
@@ -761,7 +761,7 @@ impl Bot {
                     msg.max_reply_graphemes,
                 );
 
-                for handler in message_handlers.iter() {
+                for handler in raw_message_handlers.iter() {
                     let handler = handler.clone();
                     let ctx = ctx.clone();
                     let hook = error_hook.clone();
@@ -772,7 +772,7 @@ impl Bot {
                         let channel = ctx.channel().to_string();
                         if let Err(e) = handler(ctx).await {
                             hook(HandlerError {
-                                kind: HandlerErrorKind::Message,
+                                kind: HandlerErrorKind::RawMessage,
                                 platform,
                                 channel,
                                 error: e,
@@ -987,12 +987,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn on_message_fires_for_all_messages() {
+    async fn on_raw_message_fires_for_all_messages() {
         let count = Arc::new(Mutex::new(0u32));
         let count_clone = count.clone();
 
         let mut bot = Bot::new();
-        bot.on_message(move |_ctx| {
+        bot.on_raw_message(move |_ctx| {
             let count = count_clone.clone();
             async move {
                 *count.lock().unwrap() += 1;
@@ -1474,14 +1474,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn on_message_and_command_both_fire() {
+    async fn on_raw_message_and_command_both_fire() {
         let msg_count = Arc::new(Mutex::new(0u32));
         let cmd_fired = Arc::new(Mutex::new(false));
         let mc = msg_count.clone();
         let cf = cmd_fired.clone();
 
         let mut bot = Bot::new();
-        bot.on_message(move |_ctx| {
+        bot.on_raw_message(move |_ctx| {
             let mc = mc.clone();
             async move {
                 *mc.lock().unwrap() += 1;
@@ -1503,20 +1503,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn multiple_message_handlers_all_fire() {
+    async fn multiple_raw_message_handlers_all_fire() {
         let count = Arc::new(Mutex::new(0u32));
         let c1 = count.clone();
         let c2 = count.clone();
 
         let mut bot = Bot::new();
-        bot.on_message(move |_ctx| {
+        bot.on_raw_message(move |_ctx| {
             let c = c1.clone();
             async move {
                 *c.lock().unwrap() += 1;
                 Ok(())
             }
         });
-        bot.on_message(move |_ctx| {
+        bot.on_raw_message(move |_ctx| {
             let c = c2.clone();
             async move {
                 *c.lock().unwrap() += 1;
@@ -1535,7 +1535,7 @@ mod tests {
         let c = count.clone();
 
         let mut bot = Bot::new();
-        bot.on_message(move |_ctx| {
+        bot.on_raw_message(move |_ctx| {
             let c = c.clone();
             async move {
                 *c.lock().unwrap() += 1;
@@ -1665,12 +1665,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn args_empty_for_on_message_handlers() {
+    async fn args_empty_for_on_raw_message_handlers() {
         let got = Arc::new(Mutex::new(false));
         let g = got.clone();
 
         let mut bot = Bot::new();
-        bot.on_message(move |ctx| {
+        bot.on_raw_message(move |ctx| {
             let g = g.clone();
             async move {
                 *g.lock().unwrap() = ctx.args().is_empty();
@@ -1684,16 +1684,16 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // on_message_for / on_message_platform tests
+    // on_raw_message_for / on_raw_message_platform tests
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn on_message_for_fires_on_matching_channel() {
+    async fn on_raw_message_for_fires_on_matching_channel() {
         let fired = Arc::new(Mutex::new(false));
         let f = fired.clone();
 
         let mut bot = Bot::new();
-        bot.on_message_for("ch-a", move |_ctx| {
+        bot.on_raw_message_for("ch-a", move |_ctx| {
             let f = f.clone();
             async move {
                 *f.lock().unwrap() = true;
@@ -1707,12 +1707,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn on_message_for_does_not_fire_on_wrong_channel() {
+    async fn on_raw_message_for_does_not_fire_on_wrong_channel() {
         let fired = Arc::new(Mutex::new(false));
         let f = fired.clone();
 
         let mut bot = Bot::new();
-        bot.on_message_for("ch-a", move |_ctx| {
+        bot.on_raw_message_for("ch-a", move |_ctx| {
             let f = f.clone();
             async move {
                 *f.lock().unwrap() = true;
@@ -1726,12 +1726,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn on_message_platform_fires_on_matching_platform() {
+    async fn on_raw_message_platform_fires_on_matching_platform() {
         let fired = Arc::new(Mutex::new(false));
         let f = fired.clone();
 
         let mut bot = Bot::new();
-        bot.on_message_platform("twitch", move |_ctx| {
+        bot.on_raw_message_platform("twitch", move |_ctx| {
             let f = f.clone();
             async move {
                 *f.lock().unwrap() = true;
@@ -1758,12 +1758,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn on_message_platform_does_not_fire_on_wrong_platform() {
+    async fn on_raw_message_platform_does_not_fire_on_wrong_platform() {
         let fired = Arc::new(Mutex::new(false));
         let f = fired.clone();
 
         let mut bot = Bot::new();
-        bot.on_message_platform("twitch", move |_ctx| {
+        bot.on_raw_message_platform("twitch", move |_ctx| {
             let f = f.clone();
             async move {
                 *f.lock().unwrap() = true;
@@ -1785,7 +1785,7 @@ mod tests {
         let mut bot = Bot::new();
         let handle = bot.shutdown_handle();
 
-        bot.on_message(move |_ctx| async move { Ok(()) });
+        bot.on_raw_message(move |_ctx| async move { Ok(()) });
 
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;

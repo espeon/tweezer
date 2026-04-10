@@ -61,7 +61,7 @@ bot.add_command(Command::new("ping", |ctx: Context| async move {
 }).description("responds with pong").category("general"));
 ```
 
-`ctx.args()` returns the parsed arguments after the command name. Empty for `on_message` handlers.
+`ctx.args()` returns the parsed arguments after the command name. Empty for `on_raw_message` handlers.
 
 ```rust
 bot.add_command(Command::new("ban", |ctx: Context| async move {
@@ -82,19 +82,19 @@ bot.help_command();
 // !help -> shows ping (global) and timer (if on the right channel), grouped by category
 ```
 
-## message handlers
+## raw message handlers
 
 ```rust
-bot.on_message(|ctx| async move {
+bot.on_raw_message(|ctx| async move {
     println!("[{}] {}: {}", ctx.channel(), ctx.user().name, ctx.message);
     Ok(())
 });
 
-bot.on_message_for("my-channel", |ctx| async move {
+bot.on_raw_message_for("my-channel", |ctx| async move {
     ctx.reply("channel-specific response").await
 });
 
-bot.on_message_platform("streamplace", |ctx| async move {
+bot.on_raw_message_platform("streamplace", |ctx| async move {
     ctx.reply("streamplace-specific response").await
 });
 ```
@@ -215,7 +215,7 @@ let (overlay_tx, _) = broadcast::channel::<String>(256);
 
 // handler sends each message as JSON
 let tx = overlay_tx.clone();
-bot.on_message(move |ctx| {
+bot.on_raw_message(move |ctx| {
     let tx = tx.clone();
     async move {
         let json = serde_json::json!({
