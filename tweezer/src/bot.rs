@@ -19,6 +19,9 @@ use crate::{
 type BoxFuture = Pin<Box<dyn Future<Output = Result<(), TweezerError>> + Send + 'static>>;
 type Handler = Arc<dyn Fn(Context) -> BoxFuture + Send + Sync>;
 type TriggerHandler = Arc<dyn Fn(TriggerContext) -> BoxFuture + Send + Sync>;
+type BeforeCommandHook = Arc<dyn Fn(Context, String) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
+type AfterCommandHook = Arc<dyn Fn(Context, String, Result<(), TweezerError>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+type UnrecognizedCommandHook = Arc<dyn Fn(Context, String) -> BoxFuture + Send + Sync>;
 
 struct CooldownState {
     global_cooldown: Option<Duration>,
@@ -163,6 +166,7 @@ pub enum HandlerErrorKind {
     Command { name: String },
     RawMessage,
     Trigger,
+    UnrecognizedCommand,
 }
 
 type ErrorHook = Arc<dyn Fn(HandlerError) + Send + Sync>;
@@ -184,6 +188,12 @@ fn default_error_handler(e: HandlerError) {
         HandlerErrorKind::Trigger => {
             eprintln!(
                 "[{}/{}] trigger handler error: {}",
+                e.platform, e.channel, e.error
+            )
+        }
+        HandlerErrorKind::UnrecognizedCommand => {
+            eprintln!(
+                "[{}/{}] unrecognized command handler error: {}",
                 e.platform, e.channel, e.error
             )
         }
@@ -253,6 +263,9 @@ pub struct Bot {
     raw_message_handlers: Vec<Handler>,
     trigger_handlers: Vec<(TriggerMatcher, TriggerHandler)>,
     error_hook: Option<ErrorHook>,
+    before_command_hook: Option<BeforeCommandHook>,
+    after_command_hook: Option<AfterCommandHook>,
+    unrecognized_command_hook: Option<UnrecognizedCommandHook>,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
     max_concurrency: usize,
@@ -272,6 +285,9 @@ impl Bot {
             raw_message_handlers: Vec::new(),
             trigger_handlers: Vec::new(),
             error_hook: None,
+            before_command_hook: None,
+            after_command_hook: None,
+            unrecognized_command_hook: None,
             shutdown_tx,
             shutdown_rx,
             max_concurrency: 256,
@@ -313,6 +329,30 @@ impl Bot {
 
     pub fn on_error<F: Fn(HandlerError) + Send + Sync + 'static>(&mut self, f: F) {
         self.error_hook = Some(Arc::new(f));
+    }
+
+    pub fn on_before_command<F, Fut>(&mut self, hook: F)
+    where
+        F: Fn(Context, String) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = bool> + Send + 'static,
+    {
+        self.before_command_hook = Some(Arc::new(move |ctx, cmd| Box::pin(hook(ctx, cmd))));
+    }
+
+    pub fn on_after_command<F, Fut>(&mut self, hook: F)
+    where
+        F: Fn(Context, String, Result<(), TweezerError>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.after_command_hook = Some(Arc::new(move |ctx, cmd, result| Box::pin(hook(ctx, cmd, result))));
+    }
+
+    pub fn on_unrecognized_command<F, Fut>(&mut self, hook: F)
+    where
+        F: Fn(Context, String) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), TweezerError>> + Send + 'static,
+    {
+        self.unrecognized_command_hook = Some(Arc::new(move |ctx, cmd| Box::pin(hook(ctx, cmd))));
     }
 
     pub fn add_command<F, Fut>(&mut self, cmd: Command<F, Fut>)
@@ -703,6 +743,9 @@ impl Bot {
         let error_hook: Arc<dyn Fn(HandlerError) + Send + Sync> = self
             .error_hook
             .unwrap_or_else(|| Arc::new(default_error_handler));
+        let before_command_hook = self.before_command_hook;
+        let after_command_hook = self.after_command_hook;
+        let unrecognized_command_hook = self.unrecognized_command_hook;
         let command_prefix = self.command_prefix;
         let mut shutdown_rx = self.shutdown_rx;
         let semaphore = Arc::new(Semaphore::new(self.max_concurrency));
@@ -717,6 +760,7 @@ impl Bot {
                         Some(event) => Self::dispatch(
                             event, &commands, &channel_commands, &platform_commands,
                             &raw_message_handlers, &trigger_handlers, &error_hook, command_prefix,
+                            &before_command_hook, &after_command_hook, &unrecognized_command_hook,
                             &semaphore, &state, &mut join_set,
                         ),
                         None => break,
@@ -744,6 +788,9 @@ impl Bot {
         trigger_handlers: &Arc<Vec<(TriggerMatcher, TriggerHandler)>>,
         error_hook: &Arc<dyn Fn(HandlerError) + Send + Sync>,
         command_prefix: char,
+        before_command_hook: &Option<BeforeCommandHook>,
+        after_command_hook: &Option<AfterCommandHook>,
+        unrecognized_command_hook: &Option<UnrecognizedCommandHook>,
         semaphore: &Arc<Semaphore>,
         state: &Arc<TypeMap>,
         join_set: &mut JoinSet<()>,
@@ -790,6 +837,9 @@ impl Bot {
                         }
                         _ => Vec::new(),
                     };
+                    if cmd.is_empty() {
+                        return;
+                    }
                     // Lookup priority: channel-specific -> platform-specific -> global
                     let entry = channel_commands
                         .get(&(ctx.channel().to_string(), cmd.clone()))
@@ -807,15 +857,69 @@ impl Bot {
                             return;
                         }
                         let ctx = ctx.with_args(args);
+
+                        if let Some(before_hook) = before_command_hook {
+                            let before_hook = before_hook.clone();
+                            let before_ctx = ctx.clone();
+                            let before_cmd = cmd.clone();
+                            let handler = handler.clone();
+                            let hook = error_hook.clone();
+                            let after_hook = after_command_hook.clone();
+                            let sem = semaphore.clone();
+                            let platform = ctx.platform().to_string();
+                            let channel = ctx.channel().to_string();
+                            join_set.spawn(async move {
+                                let _permit = sem.acquire().await.unwrap();
+                                if !before_hook(before_ctx, before_cmd).await {
+                                    return;
+                                }
+                                let result = handler(ctx.clone()).await;
+                                if let Some(after) = after_hook {
+                                    after(ctx.clone(), cmd.clone(), result.clone()).await;
+                                }
+                                if let Err(e) = result {
+                                    hook(HandlerError {
+                                        kind: HandlerErrorKind::Command { name: cmd },
+                                        platform,
+                                        channel,
+                                        error: e,
+                                    });
+                                }
+                            });
+                        } else {
+                            let hook = error_hook.clone();
+                            let after_hook = after_command_hook.clone();
+                            let sem = semaphore.clone();
+                            join_set.spawn(async move {
+                                let _permit = sem.acquire().await.unwrap();
+                                let platform = ctx.platform().to_string();
+                                let channel = ctx.channel().to_string();
+                                let result = handler(ctx.clone()).await;
+                                if let Some(after) = after_hook {
+                                    after(ctx, cmd.clone(), result.clone()).await;
+                                }
+                                if let Err(e) = result {
+                                    hook(HandlerError {
+                                        kind: HandlerErrorKind::Command { name: cmd },
+                                        platform,
+                                        channel,
+                                        error: e,
+                                    });
+                                }
+                            });
+                        }
+                    } else if let Some(unrecognized_hook) = unrecognized_command_hook {
+                        let unrecognized_hook = unrecognized_hook.clone();
+                        let ctx = ctx.with_args(args);
                         let hook = error_hook.clone();
                         let sem = semaphore.clone();
                         join_set.spawn(async move {
                             let _permit = sem.acquire().await.unwrap();
                             let platform = ctx.platform().to_string();
                             let channel = ctx.channel().to_string();
-                            if let Err(e) = handler(ctx).await {
+                            if let Err(e) = unrecognized_hook(ctx, cmd).await {
                                 hook(HandlerError {
-                                    kind: HandlerErrorKind::Command { name: cmd },
+                                    kind: HandlerErrorKind::UnrecognizedCommand,
                                     platform,
                                     channel,
                                     error: e,
@@ -1471,6 +1575,196 @@ mod tests {
         let (reply_tx, _) = mpsc::channel(1);
         run_with_events(bot, vec![make_message("!unknown", reply_tx)]).await;
         assert!(!*fired.lock().unwrap());
+    }
+
+    // -----------------------------------------------------------------------
+    // on_before_command / on_after_command / on_unrecognized_command tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn before_command_fires_before_handler() {
+        let order = Arc::new(Mutex::new(Vec::<String>::new()));
+        let o1 = order.clone();
+        let o2 = order.clone();
+
+        let mut bot = Bot::new();
+        bot.add_command(Command::new("ping", move |_ctx| {
+            let o = o2.clone();
+            async move {
+                o.lock().unwrap().push("handler".into());
+                Ok(())
+            }
+        }));
+        bot.on_before_command(move |_ctx, cmd| {
+            let o = o1.clone();
+            async move {
+                o.lock().unwrap().push(format!("before:{cmd}"));
+                true
+            }
+        });
+
+        let (reply_tx, _) = mpsc::channel(1);
+        run_with_events(bot, vec![make_message("!ping", reply_tx)]).await;
+        let got = order.lock().unwrap().clone();
+        assert_eq!(got, vec!["before:ping", "handler"]);
+    }
+
+    #[tokio::test]
+    async fn before_command_returning_false_skips_handler() {
+        let handler_fired = Arc::new(Mutex::new(false));
+        let hf = handler_fired.clone();
+
+        let mut bot = Bot::new();
+        bot.add_command(Command::new("ping", move |_ctx| {
+            let hf = hf.clone();
+            async move {
+                *hf.lock().unwrap() = true;
+                Ok(())
+            }
+        }));
+        bot.on_before_command(|_ctx, _cmd| async { false });
+
+        let (reply_tx, _) = mpsc::channel(1);
+        run_with_events(bot, vec![make_message("!ping", reply_tx)]).await;
+        assert!(!*handler_fired.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn after_command_fires_after_handler_success() {
+        let got_result = Arc::new(Mutex::new(None));
+        let gr = got_result.clone();
+
+        let mut bot = Bot::new();
+        bot.add_command(Command::new("ping", |_ctx| async { Ok(()) }));
+        bot.on_after_command(move |_ctx, cmd, result| {
+            let gr = gr.clone();
+            async move {
+                *gr.lock().unwrap() = Some((cmd, result.is_ok()));
+            }
+        });
+
+        let (reply_tx, _) = mpsc::channel(1);
+        run_with_events(bot, vec![make_message("!ping", reply_tx)]).await;
+        let got = got_result.lock().unwrap().clone();
+        assert_eq!(got, Some(("ping".into(), true)));
+    }
+
+    #[tokio::test]
+    async fn after_command_fires_after_handler_error() {
+        let got_result = Arc::new(Mutex::new(None));
+        let gr = got_result.clone();
+
+        let mut bot = Bot::new();
+        bot.add_command(Command::new("fail", |_ctx| async {
+            Err(TweezerError::Trigger("oops".into()))
+        }));
+        bot.on_after_command(move |_ctx, cmd, result| {
+            let gr = gr.clone();
+            async move {
+                *gr.lock().unwrap() = Some((cmd, result.is_err()));
+            }
+        });
+
+        let (reply_tx, _) = mpsc::channel(1);
+        run_with_events(bot, vec![make_message("!fail", reply_tx)]).await;
+        let got = got_result.lock().unwrap().clone();
+        assert_eq!(got, Some(("fail".into(), true)));
+    }
+
+    #[tokio::test]
+    async fn unrecognized_command_fires_for_unknown_name() {
+        let got_cmd = Arc::new(Mutex::new(String::new()));
+        let gc = got_cmd.clone();
+
+        let mut bot = Bot::new();
+        bot.on_unrecognized_command(move |_ctx, cmd| {
+            let gc = gc.clone();
+            async move {
+                *gc.lock().unwrap() = cmd;
+                Ok(())
+            }
+        });
+
+        let (reply_tx, _) = mpsc::channel(1);
+        run_with_events(bot, vec![make_message("!nope", reply_tx)]).await;
+        assert_eq!(*got_cmd.lock().unwrap(), "nope");
+    }
+
+    #[tokio::test]
+    async fn unrecognized_command_does_not_fire_for_known_command() {
+        let fired = Arc::new(Mutex::new(false));
+        let f = fired.clone();
+
+        let mut bot = Bot::new();
+        bot.add_command(Command::new("ping", |_ctx| async { Ok(()) }));
+        bot.on_unrecognized_command(move |_ctx, _cmd| {
+            let f = f.clone();
+            async move {
+                *f.lock().unwrap() = true;
+                Ok(())
+            }
+        });
+
+        let (reply_tx, _) = mpsc::channel(1);
+        run_with_events(bot, vec![make_message("!ping", reply_tx)]).await;
+        assert!(!*fired.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn unrecognized_command_does_not_fire_for_plain_message() {
+        let fired = Arc::new(Mutex::new(false));
+        let f = fired.clone();
+
+        let mut bot = Bot::new();
+        bot.on_unrecognized_command(move |_ctx, _cmd| {
+            let f = f.clone();
+            async move {
+                *f.lock().unwrap() = true;
+                Ok(())
+            }
+        });
+
+        let (reply_tx, _) = mpsc::channel(1);
+        run_with_events(bot, vec![make_message("hello", reply_tx)]).await;
+        assert!(!*fired.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn unrecognized_command_does_not_fire_for_bare_prefix() {
+        let fired = Arc::new(Mutex::new(false));
+        let f = fired.clone();
+
+        let mut bot = Bot::new();
+        bot.on_unrecognized_command(move |_ctx, _cmd| {
+            let f = f.clone();
+            async move {
+                *f.lock().unwrap() = true;
+                Ok(())
+            }
+        });
+
+        let (reply_tx, _) = mpsc::channel(1);
+        run_with_events(bot, vec![make_message("!", reply_tx)]).await;
+        assert!(!*fired.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn unrecognized_command_receives_args() {
+        let got_args = Arc::new(Mutex::new(Vec::<String>::new()));
+        let ga = got_args.clone();
+
+        let mut bot = Bot::new();
+        bot.on_unrecognized_command(move |ctx, _cmd| {
+            let ga = ga.clone();
+            async move {
+                *ga.lock().unwrap() = ctx.args().to_vec();
+                Ok(())
+            }
+        });
+
+        let (reply_tx, _) = mpsc::channel(1);
+        run_with_events(bot, vec![make_message("!nope a b c", reply_tx)]).await;
+        assert_eq!(*got_args.lock().unwrap(), vec!["a", "b", "c"]);
     }
 
     #[tokio::test]

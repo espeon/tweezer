@@ -1,4 +1,4 @@
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum TweezerError {
     #[error("adapter connection failed: {0}")]
     Connection(String),
