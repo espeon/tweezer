@@ -15,11 +15,12 @@ use rocketman::{
 use serde::Deserialize;
 use tokio::sync::mpsc;
 use tracing::{error, info};
-use tweezer::{Adapter, BotTx, IncomingMessage, OutgoingMessage, TweezerError, User};
+use tweezer::{Adapter, BotTx, IncomingMessage, OutgoingMessage, TriggerEvent, TriggerKind, TweezerError, User};
 
 use crate::xrpc::{OutgoingFacet, UserCache, XrpcClient, resolve_pds};
 
 const COLLECTION: &str = "place.stream.chat.message";
+const FOLLOW_COLLECTION: &str = "app.bsky.graph.follow";
 
 #[derive(Deserialize)]
 struct Facet {
@@ -223,7 +224,10 @@ impl Adapter for StreamplaceAdapter {
 
         let opts = JetstreamOptions::builder()
             .ws_url(JetstreamEndpoints::Custom(self.jetstream_url.clone()))
-            .wanted_collections(vec![COLLECTION.to_string()])
+            .wanted_collections(vec![
+                COLLECTION.to_string(),
+                FOLLOW_COLLECTION.to_string(),
+            ])
             .build();
 
         let jetstream = JetstreamConnection::new(opts);
@@ -231,10 +235,21 @@ impl Adapter for StreamplaceAdapter {
         let reconnect_tx = jetstream.get_reconnect_tx();
         let cursor: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
 
+        let follow_shared = Arc::new(SharedState {
+            bot_tx: bot.clone(),
+            streamers: self.streamers.clone(),
+            xrpc: xrpc.clone(),
+            user_cache: UserCache::new(),
+        });
+
         let mut ingestors = Ingestors::new();
         ingestors.commits.insert(
             COLLECTION.to_string(),
             Box::new(ChatMessageIngestor { shared, emote_fn }),
+        );
+        ingestors.commits.insert(
+            FOLLOW_COLLECTION.to_string(),
+            Box::new(FollowIngestor { shared: follow_shared }),
         );
 
         let c_cursor = cursor.clone();
@@ -373,6 +388,64 @@ impl LexiconIngestor for ChatMessageIngestor {
                 self.emote_fn.clone(),
             )
             .max_reply_graphemes(300),
+        );
+
+        self.shared.bot_tx.send(event).await.ok();
+
+        Ok(())
+    }
+}
+
+struct FollowIngestor {
+    shared: Arc<SharedState>,
+}
+
+#[async_trait]
+impl LexiconIngestor for FollowIngestor {
+    async fn ingest(&self, message: Event<serde_json::Value>) -> anyhow::Result<()> {
+        let commit = match &message.commit {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+
+        if !matches!(commit.operation, Operation::Create) {
+            return Ok(());
+        }
+
+        let record = match &commit.record {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+
+        let subject = match record.get("subject").and_then(|v| v.as_str()) {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+
+        if !self.shared.streamers.contains(subject) {
+            return Ok(());
+        }
+
+        let follower_did = message.did.clone();
+        let display_name = self.shared.user_cache.resolve_handle(&follower_did).await;
+        info!(follower = %follower_did, streamer = subject, "follow event");
+
+        let (reply_tx, _) = mpsc::channel::<OutgoingMessage>(1);
+
+        let event = tweezer::Event::Trigger(
+            TriggerEvent::new(
+                "streamplace",
+                subject,
+                TriggerKind::Follow {
+                    user: User {
+                        name: follower_did.clone(),
+                        id: follower_did,
+                        display_name,
+                    },
+                },
+                reply_tx,
+                Arc::new(|name| format!(":{}:", name)),
+            ),
         );
 
         self.shared.bot_tx.send(event).await.ok();
