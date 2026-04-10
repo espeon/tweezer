@@ -11,7 +11,7 @@ use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::task::JoinSet;
 
 use crate::{
-    Adapter, Context, Event, TweezerError,
+    Adapter, Context, Event, LifecycleKind, TweezerError,
     trigger::{TriggerContext, TriggerKind},
     typemap::TypeMap,
 };
@@ -22,6 +22,7 @@ type TriggerHandler = Arc<dyn Fn(TriggerContext) -> BoxFuture + Send + Sync>;
 type BeforeCommandHook = Arc<dyn Fn(Context, String) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
 type AfterCommandHook = Arc<dyn Fn(Context, String, Result<(), TweezerError>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 type UnrecognizedCommandHook = Arc<dyn Fn(Context, String) -> BoxFuture + Send + Sync>;
+type LifecycleHandler = Arc<dyn Fn(LifecycleKind, String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 struct CooldownState {
     global_cooldown: Option<Duration>,
@@ -276,6 +277,7 @@ pub struct Bot {
     before_command_hook: Option<BeforeCommandHook>,
     after_command_hook: Option<AfterCommandHook>,
     unrecognized_command_hook: Option<UnrecognizedCommandHook>,
+    lifecycle_handler: Option<LifecycleHandler>,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
     max_concurrency: usize,
@@ -298,6 +300,7 @@ impl Bot {
             before_command_hook: None,
             after_command_hook: None,
             unrecognized_command_hook: None,
+            lifecycle_handler: None,
             shutdown_tx,
             shutdown_rx,
             max_concurrency: 256,
@@ -363,6 +366,14 @@ impl Bot {
         Fut: Future<Output = Result<(), TweezerError>> + Send + 'static,
     {
         self.unrecognized_command_hook = Some(Arc::new(move |ctx, cmd| Box::pin(hook(ctx, cmd))));
+    }
+
+    pub fn on_lifecycle<F, Fut>(&mut self, handler: F)
+    where
+        F: Fn(LifecycleKind, String) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.lifecycle_handler = Some(Arc::new(move |kind, platform| Box::pin(handler(kind, platform))));
     }
 
     pub fn add_command<F, Fut>(&mut self, cmd: Command<F, Fut>)
@@ -757,6 +768,7 @@ impl Bot {
         let before_command_hook = self.before_command_hook;
         let after_command_hook = self.after_command_hook;
         let unrecognized_command_hook = self.unrecognized_command_hook;
+        let lifecycle_handler = self.lifecycle_handler;
         let command_prefix = self.command_prefix;
         let mut shutdown_rx = self.shutdown_rx;
         let semaphore = Arc::new(Semaphore::new(self.max_concurrency));
@@ -772,6 +784,7 @@ impl Bot {
                             event, &commands, &channel_commands, &platform_commands,
                             &raw_message_handlers, &trigger_handlers, &error_hook, command_prefix,
                             &before_command_hook, &after_command_hook, &unrecognized_command_hook,
+                            &lifecycle_handler,
                             &semaphore, &state, &mut join_set,
                         ),
                         None => break,
@@ -802,6 +815,7 @@ impl Bot {
         before_command_hook: &Option<BeforeCommandHook>,
         after_command_hook: &Option<AfterCommandHook>,
         unrecognized_command_hook: &Option<UnrecognizedCommandHook>,
+        lifecycle_handler: &Option<LifecycleHandler>,
         semaphore: &Arc<Semaphore>,
         state: &Arc<TypeMap>,
         join_set: &mut JoinSet<()>,
@@ -987,6 +1001,17 @@ impl Bot {
                     }
                 }
             }
+
+            Event::Lifecycle(lifecycle_event) => {
+                if let Some(handler) = lifecycle_handler {
+                    let handler = handler.clone();
+                    let kind = lifecycle_event.kind;
+                    let platform = lifecycle_event.platform;
+                    join_set.spawn(async move {
+                        handler(kind, platform).await;
+                    });
+                }
+            }
         }
     }
 }
@@ -1008,7 +1033,8 @@ mod tests {
     use tokio::sync::mpsc;
 
     use crate::{
-        BotTx, Event, IncomingMessage, OutgoingMessage, TweezerError, User,
+        BotTx, Event, IncomingMessage, LifecycleEvent, LifecycleKind, OutgoingMessage,
+        TweezerError, User,
         trigger::{TriggerEvent, TriggerKind},
     };
 
@@ -1049,9 +1075,13 @@ mod tests {
         })
     }
 
-    // Drives the bot's run loop with a fixed set of events, then drops the
-    // sender so the loop terminates naturally. Returns only after all spawned
-    // handler tasks have completed (via JoinSet::join_all).
+    fn make_lifecycle(platform: &str, kind: LifecycleKind) -> Event {
+        Event::Lifecycle(LifecycleEvent {
+            platform: platform.into(),
+            kind,
+        })
+    }
+
     async fn run_with_events(bot: Bot, events: Vec<Event>) {
         struct DirectAdapter {
             events: Mutex<Vec<Event>>,
@@ -1936,6 +1966,76 @@ mod tests {
         let (reply_tx, _) = mpsc::channel(1);
         run_with_events(bot, vec![make_message("!ping", reply_tx)]).await;
         assert!(!*fired.lock().unwrap());
+    }
+
+    // -----------------------------------------------------------------------
+    // Lifecycle event tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn lifecycle_handler_fires_on_connected() {
+        let got = Arc::new(Mutex::new(None));
+        let g = got.clone();
+
+        let mut bot = Bot::new();
+        bot.on_lifecycle(move |kind, platform| {
+            let g = g.clone();
+            async move {
+                *g.lock().unwrap() = Some((kind, platform));
+            }
+        });
+
+        run_with_events(bot, vec![make_lifecycle("test", LifecycleKind::Connected)]).await;
+        let got = got.lock().unwrap().clone();
+        assert_eq!(got, Some((LifecycleKind::Connected, "test".into())));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_handler_fires_on_ready() {
+        let got = Arc::new(Mutex::new(None));
+        let g = got.clone();
+
+        let mut bot = Bot::new();
+        bot.on_lifecycle(move |kind, platform| {
+            let g = g.clone();
+            async move {
+                *g.lock().unwrap() = Some((kind, platform));
+            }
+        });
+
+        run_with_events(bot, vec![make_lifecycle("test", LifecycleKind::Ready)]).await;
+        let got = got.lock().unwrap().clone();
+        assert_eq!(got, Some((LifecycleKind::Ready, "test".into())));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_handler_fires_on_disconnected() {
+        let got = Arc::new(Mutex::new(None));
+        let g = got.clone();
+
+        let mut bot = Bot::new();
+        bot.on_lifecycle(move |kind, platform| {
+            let g = g.clone();
+            async move {
+                *g.lock().unwrap() = Some((kind, platform));
+            }
+        });
+
+        run_with_events(bot, vec![make_lifecycle("streamplace", LifecycleKind::Disconnected)]).await;
+        let got = got.lock().unwrap().clone();
+        assert_eq!(got, Some((LifecycleKind::Disconnected, "streamplace".into())));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_without_handler_is_ignored() {
+        let mut bot = Bot::new();
+        bot.add_command(Command::new("ping", |_ctx| async { Ok(()) }));
+
+        let (reply_tx, _) = mpsc::channel(1);
+        run_with_events(bot, vec![
+            make_lifecycle("test", LifecycleKind::Connected),
+            make_message("!ping", reply_tx),
+        ]).await;
     }
 
     #[tokio::test]

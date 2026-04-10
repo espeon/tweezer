@@ -7,8 +7,8 @@ use std::{
 use async_trait::async_trait;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tweezer::{
-    Adapter, BotTx, Event, IncomingMessage, OutgoingMessage, PlatformTrigger,
-    TriggerEvent, TriggerKind, TweezerError, User,
+    Adapter, BotTx, Event, IncomingMessage, LifecycleEvent, LifecycleKind, OutgoingMessage,
+    PlatformTrigger, TriggerEvent, TriggerKind, TweezerError, User,
 };
 
 // ---------------------------------------------------------------------------
@@ -84,6 +84,11 @@ impl Adapter for ConsoleAdapter {
         let platform = self.platform.clone();
         let username = self.username.clone();
         let emote_fn = self.emote_fn();
+
+        let _ = bot.send(Event::Lifecycle(LifecycleEvent {
+            platform: platform.clone(),
+            kind: LifecycleKind::Connected,
+        })).await;
 
         tokio::spawn(async move {
             let mut lines = BufReader::new(tokio::io::stdin()).lines();

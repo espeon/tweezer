@@ -7,6 +7,19 @@ use crate::{OutgoingMessage, User};
 pub enum Event {
     Message(IncomingMessage),
     Trigger(crate::trigger::TriggerEvent),
+    Lifecycle(LifecycleEvent),
+}
+
+pub struct LifecycleEvent {
+    pub platform: String,
+    pub kind: LifecycleKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LifecycleKind {
+    Connected,
+    Disconnected,
+    Ready,
 }
 
 pub struct IncomingMessage {

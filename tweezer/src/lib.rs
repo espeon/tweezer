@@ -17,7 +17,7 @@ pub use adapter::{Adapter, BotTx};
 pub use bot::{Bot, Command, HandlerError, HandlerErrorKind, HelpEntry, ShutdownHandle};
 pub use context::Context;
 pub use error::TweezerError;
-pub use event::{Event, IncomingMessage};
+pub use event::{Event, IncomingMessage, LifecycleEvent, LifecycleKind};
 pub use message::OutgoingMessage;
 pub use trigger::{
     PlatformTrigger, TriggerContext, TriggerEvent, TriggerKind,
