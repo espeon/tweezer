@@ -26,6 +26,26 @@ pub enum TriggerKind {
         currency: String,
         message: Option<String>,
     },
+    MessageHidden {
+        message_uri: String,
+        hidden_by: String,
+    },
+    UserBanned {
+        user: User,
+        banned_by: String,
+    },
+    UserUnbanned {
+        user_did: String,
+        unbanned_by: String,
+    },
+    MessagePinned {
+        message_uri: String,
+        pinned_by: String,
+        expires_at: Option<String>,
+    },
+    MessageUnpinned {
+        unpinned_by: String,
+    },
     Platform(Box<dyn PlatformTrigger>),
 }
 
@@ -173,7 +193,7 @@ mod tests {
     #[tokio::test]
     async fn trigger_context_reply() {
         let kind = TriggerKind::Follow {
-            user: User { name: "alice".into(), id: "1".into(), display_name: None },
+            user: User { name: "alice".into(), id: "1".into(), display_name: None, color: None, labels: Vec::new(), badges: Vec::new() },
         };
         let (ctx, mut rx) = make_trigger_ctx(kind);
         ctx.reply("welcome!").await.unwrap();

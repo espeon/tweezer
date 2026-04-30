@@ -22,6 +22,15 @@ pub enum LifecycleKind {
     Ready,
 }
 
+/// Reference to the message this reply is in response to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplyRef {
+    pub root_uri: String,
+    pub root_cid: String,
+    pub parent_uri: String,
+    pub parent_cid: String,
+}
+
 type DeleteFn = Arc<
     dyn Fn() -> Pin<Box<dyn Future<Output = Result<(), TweezerError>> + Send>> + Send + Sync,
 >;
@@ -36,6 +45,9 @@ pub struct IncomingMessage {
     pub(crate) max_reply_graphemes: Option<usize>,
     pub(crate) message_id: Option<String>,
     pub(crate) delete_fn: Option<DeleteFn>,
+    pub(crate) reply: Option<ReplyRef>,
+    pub(crate) is_streamer: bool,
+    pub(crate) is_moderator: bool,
 }
 
 impl IncomingMessage {
@@ -57,6 +69,9 @@ impl IncomingMessage {
             max_reply_graphemes: None,
             message_id: None,
             delete_fn: None,
+            reply: None,
+            is_streamer: false,
+            is_moderator: false,
         }
     }
 
@@ -76,6 +91,21 @@ impl IncomingMessage {
         Fut: Future<Output = Result<(), TweezerError>> + Send + 'static,
     {
         self.delete_fn = Some(Arc::new(move || Box::pin(f())));
+        self
+    }
+
+    pub fn reply(mut self, reply: ReplyRef) -> Self {
+        self.reply = Some(reply);
+        self
+    }
+
+    pub fn is_streamer(mut self, yes: bool) -> Self {
+        self.is_streamer = yes;
+        self
+    }
+
+    pub fn is_moderator(mut self, yes: bool) -> Self {
+        self.is_moderator = yes;
         self
     }
 }

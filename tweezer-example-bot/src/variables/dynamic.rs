@@ -78,7 +78,7 @@ mod tests {
         let (tx, _) = mpsc::channel::<OutgoingMessage>(1);
         Context::new(
             "".to_string(),
-            User { name: user.to_string(), id: "0".to_string(), display_name: None },
+            User { name: user.to_string(), id: "0".to_string(), display_name: None, color: None, labels: Vec::new(), badges: Vec::new() },
             "test".to_string(),
             "channel".to_string(),
             tx,

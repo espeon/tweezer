@@ -18,20 +18,21 @@ pub use adapter::{Adapter, BotTx};
 pub use args::{FromArgs, ParseArgsError};
 pub use bot::{Bot, Command, HandlerError, HandlerErrorKind, HelpEntry, IntoCommand, RateLimitStrategy, ShutdownHandle};
 pub use tweezer_macros::command;
-pub use context::Context;
+pub use context::{Context, ModerationAction};
 pub use error::TweezerError;
-pub use event::{Event, IncomingMessage, LifecycleEvent, LifecycleKind};
+pub use event::{Event, IncomingMessage, LifecycleEvent, LifecycleKind, ReplyRef};
 pub use message::OutgoingMessage;
 pub use trigger::{
     PlatformTrigger, TriggerContext, TriggerEvent, TriggerKind,
 };
 pub use typemap::TypeMap;
-pub use user::User;
+pub use user::{BadgeInfo, BadgeKind, ChatColor, User};
 
 pub mod prelude {
     pub use crate::{
-        Adapter, Bot, BotTx, Command, Context, FromArgs, HelpEntry, IntoCommand, ParseArgsError,
-        PlatformTrigger, RateLimitStrategy, TriggerContext, TriggerKind, TweezerError,
+        Adapter, BadgeInfo, BadgeKind, Bot, BotTx, ChatColor, Command, Context, FromArgs,
+        HelpEntry, IntoCommand, ModerationAction, ParseArgsError, PlatformTrigger,
+        RateLimitStrategy, ReplyRef, TriggerContext, TriggerKind, TweezerError,
     };
     pub use async_trait::async_trait;
     pub use tweezer_macros::command;

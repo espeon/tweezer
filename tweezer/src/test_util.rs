@@ -117,6 +117,9 @@ impl TestContextBuilder {
                 name: self.user_name,
                 id: self.user_id,
                 display_name: self.display_name,
+                color: None,
+                labels: Vec::new(),
+                badges: Vec::new(),
             },
             self.platform,
             self.channel,
@@ -258,7 +261,7 @@ mod tests {
     #[tokio::test]
     async fn trigger_context_builder_reply() {
         let kind = TriggerKind::Follow {
-            user: User { name: "alice".into(), id: "1".into(), display_name: None },
+            user: User { name: "alice".into(), id: "1".into(), display_name: None, color: None, labels: Vec::new(), badges: Vec::new() },
         };
         let (ctx, mut rx) = TestTriggerContextBuilder::new(kind).build();
         ctx.reply("welcome!").await.unwrap();
@@ -281,7 +284,7 @@ mod tests {
     #[test]
     fn trigger_context_builder_kind_accessible() {
         let kind = TriggerKind::Follow {
-            user: User { name: "bob".into(), id: "2".into(), display_name: None },
+            user: User { name: "bob".into(), id: "2".into(), display_name: None, color: None, labels: Vec::new(), badges: Vec::new() },
         };
         let (ctx, _) = TestTriggerContextBuilder::new(kind).build();
         assert!(matches!(ctx.kind, TriggerKind::Follow { .. }));

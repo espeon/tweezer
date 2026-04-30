@@ -394,6 +394,11 @@ enum TriggerMatcher {
     AnyFollow,
     AnySubscription,
     AnyDonation,
+    AnyMessageHidden,
+    AnyUserBanned,
+    AnyUserUnbanned,
+    AnyMessagePinned,
+    AnyMessageUnpinned,
     PlatformKind(String),
 }
 
@@ -405,6 +410,11 @@ impl TriggerMatcher {
             TriggerMatcher::AnyFollow => matches!(kind, TriggerKind::Follow { .. }),
             TriggerMatcher::AnySubscription => matches!(kind, TriggerKind::Subscription { .. }),
             TriggerMatcher::AnyDonation => matches!(kind, TriggerKind::Donation { .. }),
+            TriggerMatcher::AnyMessageHidden => matches!(kind, TriggerKind::MessageHidden { .. }),
+            TriggerMatcher::AnyUserBanned => matches!(kind, TriggerKind::UserBanned { .. }),
+            TriggerMatcher::AnyUserUnbanned => matches!(kind, TriggerKind::UserUnbanned { .. }),
+            TriggerMatcher::AnyMessagePinned => matches!(kind, TriggerKind::MessagePinned { .. }),
+            TriggerMatcher::AnyMessageUnpinned => matches!(kind, TriggerKind::MessageUnpinned { .. }),
             TriggerMatcher::PlatformKind(id) => {
                 matches!(kind, TriggerKind::Platform(t) if t.kind_id() == id)
             }
@@ -976,6 +986,46 @@ impl Bot {
         self.on_trigger_matched(TriggerMatcher::AnyDonation, handler);
     }
 
+    pub fn on_message_hidden<F, Fut>(&mut self, handler: F)
+    where
+        F: Fn(TriggerContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), TweezerError>> + Send + 'static,
+    {
+        self.on_trigger_matched(TriggerMatcher::AnyMessageHidden, handler);
+    }
+
+    pub fn on_user_banned<F, Fut>(&mut self, handler: F)
+    where
+        F: Fn(TriggerContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), TweezerError>> + Send + 'static,
+    {
+        self.on_trigger_matched(TriggerMatcher::AnyUserBanned, handler);
+    }
+
+    pub fn on_user_unbanned<F, Fut>(&mut self, handler: F)
+    where
+        F: Fn(TriggerContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), TweezerError>> + Send + 'static,
+    {
+        self.on_trigger_matched(TriggerMatcher::AnyUserUnbanned, handler);
+    }
+
+    pub fn on_message_pinned<F, Fut>(&mut self, handler: F)
+    where
+        F: Fn(TriggerContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), TweezerError>> + Send + 'static,
+    {
+        self.on_trigger_matched(TriggerMatcher::AnyMessagePinned, handler);
+    }
+
+    pub fn on_message_unpinned<F, Fut>(&mut self, handler: F)
+    where
+        F: Fn(TriggerContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), TweezerError>> + Send + 'static,
+    {
+        self.on_trigger_matched(TriggerMatcher::AnyMessageUnpinned, handler);
+    }
+
     pub fn on_platform_trigger<F, Fut>(&mut self, kind_id: &str, handler: F)
     where
         F: Fn(TriggerContext) -> Fut + Send + Sync + 'static,
@@ -1106,7 +1156,10 @@ impl Bot {
                     msg.max_reply_graphemes,
                 )
                 .with_message_id(msg.message_id)
-                .with_delete(msg.delete_fn);
+                .with_delete(msg.delete_fn)
+                .with_reply(msg.reply)
+                .with_streamer(msg.is_streamer)
+                .with_moderator(msg.is_moderator);
 
                 for handler in raw_message_handlers.iter() {
                     let handler = handler.clone();
@@ -1330,6 +1383,9 @@ mod tests {
                 name: "alice".into(),
                 id: "1".into(),
                 display_name: None,
+                color: None,
+                labels: Vec::new(),
+                badges: Vec::new(),
             },
             text: text.into(),
             channel: channel.into(),
@@ -1338,6 +1394,9 @@ mod tests {
             max_reply_graphemes: None,
             message_id: None,
             delete_fn: None,
+            reply: None,
+            is_streamer: false,
+            is_moderator: false,
         })
     }
 
@@ -1575,6 +1634,9 @@ mod tests {
                 name: "alice".into(),
                 id: "1".into(),
                 display_name: None,
+                color: None,
+                labels: Vec::new(),
+                badges: Vec::new(),
             },
         };
         run_with_events(bot, vec![make_trigger(kind, reply_tx)]).await;
@@ -1610,10 +1672,13 @@ mod tests {
                 make_trigger(
                     TriggerKind::Follow {
                         user: User {
-                            name: "bob".into(),
-                            id: "2".into(),
-                            display_name: None,
-                        },
+                name: "bob".into(),
+                id: "2".into(),
+                display_name: None,
+                color: None,
+                labels: Vec::new(),
+                badges: Vec::new(),
+            },
                     },
                     tx2,
                 ),
@@ -1739,6 +1804,9 @@ mod tests {
                 name: "carol".into(),
                 id: "3".into(),
                 display_name: None,
+                color: None,
+                labels: Vec::new(),
+                badges: Vec::new(),
             },
             tier: "1".into(),
             months: 1,
@@ -2455,6 +2523,9 @@ mod tests {
                 name: "alice".into(),
                 id: "1".into(),
                 display_name: None,
+                color: None,
+                labels: Vec::new(),
+                badges: Vec::new(),
             },
             amount_cents: 500,
             currency: "USD".into(),
@@ -2588,6 +2659,9 @@ mod tests {
                 name: "alice".into(),
                 id: "1".into(),
                 display_name: None,
+                color: None,
+                labels: Vec::new(),
+                badges: Vec::new(),
             },
             text: "hi".into(),
             channel: "general".into(),
@@ -2596,6 +2670,9 @@ mod tests {
             max_reply_graphemes: None,
             message_id: None,
             delete_fn: None,
+            reply: None,
+            is_streamer: false,
+            is_moderator: false,
         });
         run_with_events(bot, vec![event]).await;
         assert!(*fired.lock().unwrap());
@@ -2881,6 +2958,9 @@ mod tests {
                 name: "alice".into(),
                 id: "1".into(),
                 display_name: None,
+                color: None,
+                labels: Vec::new(),
+                badges: Vec::new(),
             },
             text: text.into(),
             channel: channel.into(),
@@ -2889,6 +2969,9 @@ mod tests {
             max_reply_graphemes: None,
             message_id: None,
             delete_fn: None,
+            reply: None,
+            is_streamer: false,
+            is_moderator: false,
         })
     }
 

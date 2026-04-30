@@ -123,7 +123,7 @@ impl Adapter for ConsoleAdapter {
                         } else {
                             Event::Message(IncomingMessage::new(
                                 platform.clone(),
-                                User { name: username.clone(), id: "0".into(), display_name: None },
+                                User { name: username.clone(), id: "0".into(), display_name: None, color: None, labels: Vec::new(), badges: Vec::new() },
                                 line,
                                 "console",
                                 reply_tx,
@@ -179,7 +179,7 @@ fn parse_trigger(
 
     let user_from_args = |args: &HashMap<String, String>| -> User {
         let name = args.get("user").cloned().unwrap_or_else(|| username.to_string());
-        User { name, id: "0".into(), display_name: None }
+        User { name, id: "0".into(), display_name: None, color: None, labels: Vec::new(), badges: Vec::new() }
     };
 
     let kind = match kind_str {

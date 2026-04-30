@@ -3,10 +3,27 @@ use std::{future::Future, pin::Pin, sync::Arc};
 use tokio::sync::mpsc::Sender;
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::{typemap::TypeMap, FromArgs, OutgoingMessage, ParseArgsError, TweezerError, User};
+use crate::{typemap::TypeMap, FromArgs, OutgoingMessage, ParseArgsError, ReplyRef, TweezerError, User};
 
 type DeleteFn = Arc<
     dyn Fn() -> Pin<Box<dyn Future<Output = Result<(), TweezerError>> + Send>> + Send + Sync,
+>;
+
+/// Platform-agnostic moderation action.
+#[derive(Debug, Clone)]
+pub enum ModerationAction {
+    HideMessage { message_uri: String },
+    UnhideMessage { gate_uri: String },
+    BanUser { user_did: String },
+    UnbanUser { block_uri: String },
+    PinMessage { message_uri: String, expires_at: Option<String> },
+    UnpinMessage { pin_uri: String },
+}
+
+type ModerationFn = Arc<
+    dyn Fn(ModerationAction) -> Pin<Box<dyn Future<Output = Result<(), TweezerError>> + Send>>
+        + Send
+        + Sync,
 >;
 
 #[derive(Clone)]
@@ -22,6 +39,10 @@ pub struct Context {
     max_reply_graphemes: Option<usize>,
     message_id: Option<String>,
     delete_fn: Option<DeleteFn>,
+    moderation_fn: Option<ModerationFn>,
+    reply: Option<ReplyRef>,
+    is_streamer: bool,
+    is_moderator: bool,
 }
 
 impl Context {
@@ -47,6 +68,10 @@ impl Context {
             max_reply_graphemes,
             message_id: None,
             delete_fn: None,
+            moderation_fn: None,
+            reply: None,
+            is_streamer: false,
+            is_moderator: false,
         }
     }
 
@@ -57,6 +82,26 @@ impl Context {
 
     pub(crate) fn with_message_id(mut self, id: Option<String>) -> Self {
         self.message_id = id;
+        self
+    }
+
+    pub(crate) fn with_moderation(mut self, moderation_fn: Option<ModerationFn>) -> Self {
+        self.moderation_fn = moderation_fn;
+        self
+    }
+
+    pub(crate) fn with_reply(mut self, reply: Option<ReplyRef>) -> Self {
+        self.reply = reply;
+        self
+    }
+
+    pub(crate) fn with_streamer(mut self, yes: bool) -> Self {
+        self.is_streamer = yes;
+        self
+    }
+
+    pub(crate) fn with_moderator(mut self, yes: bool) -> Self {
+        self.is_moderator = yes;
         self
     }
 
@@ -86,11 +131,35 @@ impl Context {
         self.message_id.as_deref()
     }
 
+    /// Reply reference if this message is a reply to another message.
+    pub fn reply_to(&self) -> Option<&ReplyRef> {
+        self.reply.as_ref()
+    }
+
+    /// True if the message author is the streamer for this channel.
+    pub fn is_streamer(&self) -> bool {
+        self.is_streamer
+    }
+
+    /// True if the message author has moderation permissions for this channel.
+    pub fn is_moderator(&self) -> bool {
+        self.is_moderator
+    }
+
     /// Delete the original message that triggered this command.
     /// Returns `Ok(())` even if the adapter does not support deletion.
     pub async fn delete(&self) -> Result<(), TweezerError> {
         if let Some(ref delete_fn) = self.delete_fn {
             delete_fn().await
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Perform a moderation action. Returns `Ok(())` if the adapter does not support moderation.
+    pub async fn moderate(&self, action: ModerationAction) -> Result<(), TweezerError> {
+        if let Some(ref moderation_fn) = self.moderation_fn {
+            moderation_fn(action).await
         } else {
             Ok(())
         }
@@ -181,7 +250,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(8);
         let ctx = Context::new(
             "hello world".into(),
-            User { name: "alice".into(), id: "1".into(), display_name: None },
+            User { name: "alice".into(), id: "1".into(), display_name: None, color: None, labels: Vec::new(), badges: Vec::new() },
             "test".into(),
             "general".into(),
             tx,
@@ -196,7 +265,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(8);
         let ctx = Context::new(
             "hello world".into(),
-            User { name: "alice".into(), id: "1".into(), display_name: None },
+            User { name: "alice".into(), id: "1".into(), display_name: None, color: None, labels: Vec::new(), badges: Vec::new() },
             "test".into(),
             "general".into(),
             tx,
@@ -373,7 +442,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(8);
         let ctx = Context::new(
             "hello world".into(),
-            User { name: "alice".into(), id: "1".into(), display_name: None },
+            User { name: "alice".into(), id: "1".into(), display_name: None, color: None, labels: Vec::new(), badges: Vec::new() },
             "test".into(),
             "general".into(),
             tx,
@@ -397,7 +466,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(8);
         let ctx = Context::new(
             "hello world".into(),
-            User { name: "alice".into(), id: "1".into(), display_name: None },
+            User { name: "alice".into(), id: "1".into(), display_name: None, color: None, labels: Vec::new(), badges: Vec::new() },
             "test".into(),
             "general".into(),
             tx,
@@ -413,7 +482,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(8);
         let ctx = Context::new(
             "hello world".into(),
-            User { name: "alice".into(), id: "1".into(), display_name: None },
+            User { name: "alice".into(), id: "1".into(), display_name: None, color: None, labels: Vec::new(), badges: Vec::new() },
             "test".into(),
             "general".into(),
             tx,
@@ -433,7 +502,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(8);
         let ctx = Context::new(
             "hello world".into(),
-            User { name: "alice".into(), id: "1".into(), display_name: None },
+            User { name: "alice".into(), id: "1".into(), display_name: None, color: None, labels: Vec::new(), badges: Vec::new() },
             "test".into(),
             "general".into(),
             tx,
@@ -449,7 +518,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(8);
         let ctx = Context::new(
             "hello world".into(),
-            User { name: "alice".into(), id: "1".into(), display_name: None },
+            User { name: "alice".into(), id: "1".into(), display_name: None, color: None, labels: Vec::new(), badges: Vec::new() },
             "test".into(),
             "general".into(),
             tx,
