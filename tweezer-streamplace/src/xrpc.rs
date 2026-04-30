@@ -13,6 +13,19 @@ pub struct XrpcClient {
     did: String,
 }
 
+#[cfg(test)]
+impl XrpcClient {
+    pub fn test_new(service: String, access_jwt: String, refresh_jwt: String, did: String) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            service,
+            access_jwt,
+            refresh_jwt,
+            did,
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct CreateSessionInput {
     identifier: String,

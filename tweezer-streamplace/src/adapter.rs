@@ -1301,4 +1301,108 @@ mod tests {
     fn scan_empty_text() {
         assert!(scan_text_facets("").is_empty());
     }
+
+    #[test]
+    fn scan_emote_finds_name() {
+        let facets = scan_emote_facets("hello :dan: world");
+        assert_eq!(facets.len(), 1);
+        assert_eq!(facets[0].0, 6);
+        assert_eq!(facets[0].1, 11);
+        assert_eq!(facets[0].2, "dan");
+    }
+
+    #[test]
+    fn scan_emote_ignores_invalid() {
+        assert!(scan_emote_facets("no emotes here").is_empty());
+        assert!(scan_emote_facets("missing colon").is_empty());
+        assert!(scan_emote_facets("empty ::").is_empty());
+        assert!(scan_emote_facets("space :a b:").is_empty());
+    }
+
+    #[test]
+    fn scan_emote_multiple() {
+        let facets = scan_emote_facets(":dan::pog:");
+        assert_eq!(facets.len(), 2);
+        assert_eq!(facets[0].2, "dan");
+        assert_eq!(facets[1].2, "pog");
+    }
+
+    #[test]
+    fn hydrate_user_no_profile() {
+        let shared = SharedState {
+            bot_tx: mpsc::channel(1).0,
+            streamers: HashSet::new(),
+            xrpc: Arc::new(XrpcClient::test_new(
+                "https://example.com".into(),
+                "x".into(),
+                "y".into(),
+                "did:plc:bot".into(),
+            )),
+            user_cache: UserCache::new(),
+            emote_fn: Arc::new(|name| format!(":{}:", name)),
+            chat_profiles: RwLock::new(HashMap::new()),
+            streamer_states: RwLock::new(HashMap::new()),
+            emote_items: RwLock::new(HashMap::new()),
+        };
+        let user = hydrate_user("did:plc:test", Some("alice".into()), &shared);
+        assert_eq!(user.name, "did:plc:test");
+        assert_eq!(user.display_name, Some("alice".into()));
+        assert!(user.color.is_none());
+        assert!(user.labels.is_empty());
+    }
+
+    #[test]
+    fn is_blocked_checks_state() {
+        let shared = SharedState {
+            bot_tx: mpsc::channel(1).0,
+            streamers: HashSet::new(),
+            xrpc: Arc::new(XrpcClient::test_new(
+                "https://example.com".into(),
+                "x".into(),
+                "y".into(),
+                "did:plc:bot".into(),
+            )),
+            user_cache: UserCache::new(),
+            emote_fn: Arc::new(|name| format!(":{}:", name)),
+            chat_profiles: RwLock::new(HashMap::new()),
+            streamer_states: RwLock::new(HashMap::new()),
+            emote_items: RwLock::new(HashMap::new()),
+        };
+        {
+            let mut states = shared.streamer_states.write().unwrap();
+            let mut state = StreamerState::default();
+            state.blocked_dids.insert("did:plc:bad".into());
+            states.insert("did:plc:streamer".into(), state);
+        }
+        assert!(is_blocked(&shared, "did:plc:streamer", "did:plc:bad"));
+        assert!(!is_blocked(&shared, "did:plc:streamer", "did:plc:good"));
+        assert!(!is_blocked(&shared, "did:plc:other", "did:plc:bad"));
+    }
+
+    #[test]
+    fn is_moderator_checks_state() {
+        let shared = SharedState {
+            bot_tx: mpsc::channel(1).0,
+            streamers: HashSet::new(),
+            xrpc: Arc::new(XrpcClient::test_new(
+                "https://example.com".into(),
+                "x".into(),
+                "y".into(),
+                "did:plc:bot".into(),
+            )),
+            user_cache: UserCache::new(),
+            emote_fn: Arc::new(|name| format!(":{}:", name)),
+            chat_profiles: RwLock::new(HashMap::new()),
+            streamer_states: RwLock::new(HashMap::new()),
+            emote_items: RwLock::new(HashMap::new()),
+        };
+        {
+            let mut states = shared.streamer_states.write().unwrap();
+            let mut state = StreamerState::default();
+            state.mod_dids.insert("did:plc:mod".into());
+            states.insert("did:plc:streamer".into(), state);
+        }
+        assert!(is_moderator(&shared, "did:plc:streamer", "did:plc:mod"));
+        assert!(!is_moderator(&shared, "did:plc:streamer", "did:plc:viewer"));
+    }
 }
