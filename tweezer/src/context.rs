@@ -1,9 +1,13 @@
-use std::sync::Arc;
+use std::{future::Future, pin::Pin, sync::Arc};
 
 use tokio::sync::mpsc::Sender;
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::{typemap::TypeMap, OutgoingMessage, TweezerError, User};
+use crate::{typemap::TypeMap, FromArgs, OutgoingMessage, ParseArgsError, TweezerError, User};
+
+type DeleteFn = Arc<
+    dyn Fn() -> Pin<Box<dyn Future<Output = Result<(), TweezerError>> + Send>> + Send + Sync,
+>;
 
 #[derive(Clone)]
 pub struct Context {
@@ -16,6 +20,8 @@ pub struct Context {
     emote_fn: Arc<dyn Fn(&str) -> String + Send + Sync>,
     state: Arc<TypeMap>,
     max_reply_graphemes: Option<usize>,
+    message_id: Option<String>,
+    delete_fn: Option<DeleteFn>,
 }
 
 impl Context {
@@ -39,7 +45,19 @@ impl Context {
             emote_fn,
             state,
             max_reply_graphemes,
+            message_id: None,
+            delete_fn: None,
         }
+    }
+
+    pub(crate) fn with_delete(mut self, delete_fn: Option<DeleteFn>) -> Self {
+        self.delete_fn = delete_fn;
+        self
+    }
+
+    pub(crate) fn with_message_id(mut self, id: Option<String>) -> Self {
+        self.message_id = id;
+        self
     }
 
     pub fn with_args(mut self, args: Vec<String>) -> Self {
@@ -61,6 +79,38 @@ impl Context {
 
     pub fn args(&self) -> &[String] {
         &self.args
+    }
+
+    /// Platform-specific message identifier, if the adapter provides one.
+    pub fn message_id(&self) -> Option<&str> {
+        self.message_id.as_deref()
+    }
+
+    /// Delete the original message that triggered this command.
+    /// Returns `Ok(())` even if the adapter does not support deletion.
+    pub async fn delete(&self) -> Result<(), TweezerError> {
+        if let Some(ref delete_fn) = self.delete_fn {
+            delete_fn().await
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Parse arguments into typed values.
+    ///
+    /// Supports primitives, `String`, `Option<T>`, tuples, and `Vec<T>`.
+    /// Returns an error if parsing fails or if there are unconsumed arguments.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let (icao, plain): (String, bool) = ctx.parse_args()?;
+    /// ```
+    pub fn parse_args<T: FromArgs>(&self) -> Result<T, ParseArgsError> {
+        let (val, rest) = T::from_args(&self.args)?;
+        if !rest.is_empty() {
+            return Err(ParseArgsError::TooManyArguments);
+        }
+        Ok(val)
     }
 
     /// Look up a value previously registered with `Bot::register`.
@@ -251,5 +301,163 @@ mod tests {
             assert!(UnicodeSegmentation::graphemes(chunk.as_str(), true).count() <= 10);
         }
         assert_eq!(chunks.join(""), text);
+    }
+
+    #[test]
+    fn parse_args_basic() {
+        let (ctx, _) = make_ctx_with_args(&["hello", "42"]);
+        let (name, count): (String, u32) = ctx.parse_args().unwrap();
+        assert_eq!(name, "hello");
+        assert_eq!(count, 42);
+    }
+
+    #[test]
+    fn parse_args_with_option_some() {
+        let (ctx, _) = make_ctx_with_args(&["hello", "42"]);
+        let (name, opt): (String, Option<u32>) = ctx.parse_args().unwrap();
+        assert_eq!(name, "hello");
+        assert_eq!(opt, Some(42));
+    }
+
+    #[test]
+    fn parse_args_with_option_none() {
+        let (ctx, _) = make_ctx_with_args(&["hello"]);
+        let (name, opt): (String, Option<u32>) = ctx.parse_args().unwrap();
+        assert_eq!(name, "hello");
+        assert_eq!(opt, None);
+    }
+
+    #[test]
+    fn parse_args_too_many() {
+        let (ctx, _) = make_ctx_with_args(&["a", "b", "c"]);
+        let result: Result<(String, String), _> = ctx.parse_args();
+        assert_eq!(result.unwrap_err(), ParseArgsError::TooManyArguments);
+    }
+
+    #[test]
+    fn parse_args_invalid_type() {
+        let (ctx, _) = make_ctx_with_args(&["abc"]);
+        let result: Result<u32, _> = ctx.parse_args();
+        assert!(
+            matches!(result, Err(ParseArgsError::InvalidValue { expected: "u32", .. })),
+            "got {result:?}"
+        );
+    }
+
+    #[test]
+    fn parse_args_missing() {
+        let (ctx, _) = make_ctx_with_args(&[]);
+        let result: Result<String, _> = ctx.parse_args();
+        assert_eq!(result.unwrap_err(), ParseArgsError::MissingArgument(0));
+    }
+
+    #[test]
+    fn parse_args_vec_consumes_rest() {
+        let (ctx, _) = make_ctx_with_args(&["a", "b", "c"]);
+        let vals: Vec<String> = ctx.parse_args().unwrap();
+        assert_eq!(vals, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn parse_args_tuple_with_vec() {
+        let (ctx, _) = make_ctx_with_args(&["cmd", "1", "2", "3"]);
+        let (cmd, nums): (String, Vec<u32>) = ctx.parse_args().unwrap();
+        assert_eq!(cmd, "cmd");
+        assert_eq!(nums, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn delete_calls_callback_when_set() {
+        let deleted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let d = deleted.clone();
+        let (tx, rx) = mpsc::channel(8);
+        let ctx = Context::new(
+            "hello world".into(),
+            User { name: "alice".into(), id: "1".into(), display_name: None },
+            "test".into(),
+            "general".into(),
+            tx,
+            Arc::new(|name| format!(":{}:", name)),
+            Arc::new(TypeMap::new()),
+            None,
+        )
+        .with_delete(Some(Arc::new(move || {
+            let d = d.clone();
+            Box::pin(async move {
+                d.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+        })));
+        ctx.delete().await.unwrap();
+        assert!(deleted.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn delete_returns_ok_when_no_callback() {
+        let (tx, rx) = mpsc::channel(8);
+        let ctx = Context::new(
+            "hello world".into(),
+            User { name: "alice".into(), id: "1".into(), display_name: None },
+            "test".into(),
+            "general".into(),
+            tx,
+            Arc::new(|name| format!(":{}:", name)),
+            Arc::new(TypeMap::new()),
+            None,
+        );
+        ctx.delete().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_propagates_error() {
+        let (tx, rx) = mpsc::channel(8);
+        let ctx = Context::new(
+            "hello world".into(),
+            User { name: "alice".into(), id: "1".into(), display_name: None },
+            "test".into(),
+            "general".into(),
+            tx,
+            Arc::new(|name| format!(":{}:", name)),
+            Arc::new(TypeMap::new()),
+            None,
+        )
+        .with_delete(Some(Arc::new(|| {
+            Box::pin(async { Err(TweezerError::Handler("nope".into())) })
+        })));
+        let err = ctx.delete().await.unwrap_err();
+        assert!(matches!(err, TweezerError::Handler(_)));
+    }
+
+    #[test]
+    fn message_id_accessor() {
+        let (tx, rx) = mpsc::channel(8);
+        let ctx = Context::new(
+            "hello world".into(),
+            User { name: "alice".into(), id: "1".into(), display_name: None },
+            "test".into(),
+            "general".into(),
+            tx,
+            Arc::new(|name| format!(":{}:", name)),
+            Arc::new(TypeMap::new()),
+            None,
+        )
+        .with_message_id(Some("msg-42".into()));
+        assert_eq!(ctx.message_id(), Some("msg-42"));
+    }
+
+    fn make_ctx_with_args(args: &[&str]) -> (Context, mpsc::Receiver<OutgoingMessage>) {
+        let (tx, rx) = mpsc::channel(8);
+        let ctx = Context::new(
+            "hello world".into(),
+            User { name: "alice".into(), id: "1".into(), display_name: None },
+            "test".into(),
+            "general".into(),
+            tx,
+            Arc::new(|name| format!(":{}:", name)),
+            Arc::new(TypeMap::new()),
+            None,
+        )
+        .with_args(args.iter().map(|s| s.to_string()).collect());
+        (ctx, rx)
     }
 }

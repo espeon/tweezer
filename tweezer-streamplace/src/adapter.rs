@@ -1,21 +1,18 @@
-use std::{
-    collections::HashSet,
-    sync::{Arc, Mutex},
-};
+use std::{collections::HashSet, sync::Arc};
 
 use async_trait::async_trait;
-use rocketman::{
-    connection::JetstreamConnection,
-    endpoints::JetstreamEndpoints,
-    handler::{self, Ingestors},
-    ingestion::LexiconIngestor,
-    options::JetstreamOptions,
-    types::event::{Event, Operation},
+use jacquard_common::{
+    CowStr, RawData,
+    deps::fluent_uri::{ParseError, Uri},
+    jetstream::{CommitOperation, RawJetstreamMessage, RawJetstreamParams},
+    xrpc::{SubscriptionClient, TungsteniteSubscriptionClient},
 };
-use serde::Deserialize;
+use n0_future::StreamExt;
 use tokio::sync::mpsc;
 use tracing::{error, info};
-use tweezer::{Adapter, BotTx, IncomingMessage, OutgoingMessage, TriggerEvent, TriggerKind, TweezerError, User};
+use tweezer::{
+    Adapter, BotTx, IncomingMessage, OutgoingMessage, TriggerEvent, TriggerKind, TweezerError, User,
+};
 
 use crate::xrpc::{OutgoingFacet, UserCache, XrpcClient, resolve_pds};
 
@@ -23,23 +20,17 @@ const COLLECTION: &str = "place.stream.chat.message";
 const FOLLOW_COLLECTION: &str = "app.bsky.graph.follow";
 const TELEPORT_COLLECTION: &str = "place.stream.live.teleport";
 
-#[derive(Deserialize)]
 struct Facet {
     index: ByteSlice,
     features: Vec<FacetFeature>,
 }
 
-#[derive(Deserialize)]
 struct ByteSlice {
-    #[serde(rename = "byteStart")]
     byte_start: usize,
-    #[serde(rename = "byteEnd")]
     byte_end: usize,
 }
 
-#[derive(Deserialize)]
 struct FacetFeature {
-    #[serde(rename = "$type")]
     type_: String,
     did: Option<String>,
     #[allow(dead_code)]
@@ -47,9 +38,19 @@ struct FacetFeature {
 }
 
 enum ScannedFacet {
-    Mention { byte_start: usize, byte_end: usize, handle: String },
-    Link { byte_start: usize, byte_end: usize },
-    BareLink { byte_start: usize, byte_end: usize },
+    Mention {
+        byte_start: usize,
+        byte_end: usize,
+        handle: String,
+    },
+    Link {
+        byte_start: usize,
+        byte_end: usize,
+    },
+    BareLink {
+        byte_start: usize,
+        byte_end: usize,
+    },
 }
 
 fn scan_text_facets(text: &str) -> Vec<ScannedFacet> {
@@ -69,7 +70,9 @@ fn scan_text_facets(text: &str) -> Vec<ScannedFacet> {
             if j > handle_start {
                 let handle_bytes = &bytes[handle_start..j];
                 if handle_bytes.contains(&b'.')
-                    && handle_bytes.last().is_some_and(|b| b.is_ascii_alphanumeric())
+                    && handle_bytes
+                        .last()
+                        .is_some_and(|b| b.is_ascii_alphanumeric())
                 {
                     facets.push(ScannedFacet::Mention {
                         byte_start: start,
@@ -81,11 +84,16 @@ fn scan_text_facets(text: &str) -> Vec<ScannedFacet> {
                 }
             }
             i += 1;
-        } else if bytes[i] == b'h' && text.is_char_boundary(i)
+        } else if bytes[i] == b'h'
+            && text.is_char_boundary(i)
             && (text[i..].starts_with("https://") || text[i..].starts_with("http://"))
         {
             let start = i;
-            let scheme_len = if text[i..].starts_with("https://") { 8 } else { 7 };
+            let scheme_len = if text[i..].starts_with("https://") {
+                8
+            } else {
+                7
+            };
             let mut j = i + scheme_len;
             while j < len && !bytes[j].is_ascii_whitespace() {
                 j += 1;
@@ -141,7 +149,11 @@ fn is_handle_byte(b: u8) -> bool {
 }
 
 fn is_domain_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'/' | b'_' | b'~' | b'%' | b'?' | b'#' | b'&' | b'=' | b'+')
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'.' | b'-' | b'/' | b'_' | b'~' | b'%' | b'?' | b'#' | b'&' | b'=' | b'+'
+        )
 }
 
 struct SharedState {
@@ -149,6 +161,7 @@ struct SharedState {
     streamers: HashSet<String>,
     xrpc: Arc<XrpcClient>,
     user_cache: UserCache,
+    emote_fn: Arc<dyn Fn(&str) -> String + Send + Sync>,
 }
 
 pub struct StreamplaceAdapter {
@@ -213,313 +226,317 @@ impl Adapter for StreamplaceAdapter {
             .await
             .map_err(TweezerError::Connection)?;
 
-        let xrpc = Arc::new(xrpc);
-        let emote_fn = self.emote_fn();
+        let base_uri = jetstream_base_uri(&self.jetstream_url)
+            .map_err(|e| TweezerError::Connection(e.to_string()))?;
 
         let shared = Arc::new(SharedState {
             bot_tx: bot.clone(),
             streamers: self.streamers.clone(),
-            xrpc: xrpc.clone(),
+            xrpc: Arc::new(xrpc),
             user_cache: UserCache::new(),
-        });
-
-        let opts = JetstreamOptions::builder()
-            .ws_url(JetstreamEndpoints::Custom(self.jetstream_url.clone()))
-            .wanted_collections(vec![
-                COLLECTION.to_string(),
-                FOLLOW_COLLECTION.to_string(),
-                TELEPORT_COLLECTION.to_string(),
-            ])
-            .build();
-
-        let jetstream = JetstreamConnection::new(opts);
-        let msg_rx = jetstream.get_msg_rx();
-        let reconnect_tx = jetstream.get_reconnect_tx();
-        let cursor: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
-
-        let follow_shared = Arc::new(SharedState {
-            bot_tx: bot.clone(),
-            streamers: self.streamers.clone(),
-            xrpc: xrpc.clone(),
-            user_cache: UserCache::new(),
-        });
-
-        let teleport_shared = Arc::new(SharedState {
-            bot_tx: bot.clone(),
-            streamers: self.streamers.clone(),
-            xrpc: xrpc.clone(),
-            user_cache: UserCache::new(),
-        });
-
-        let mut ingestors = Ingestors::new();
-        ingestors.commits.insert(
-            COLLECTION.to_string(),
-            Box::new(ChatMessageIngestor { shared, emote_fn }),
-        );
-        ingestors.commits.insert(
-            FOLLOW_COLLECTION.to_string(),
-            Box::new(FollowIngestor { shared: follow_shared }),
-        );
-        ingestors.commits.insert(
-            TELEPORT_COLLECTION.to_string(),
-            Box::new(TeleportIngestor { shared: teleport_shared }),
-        );
-
-        let c_cursor = cursor.clone();
-        tokio::spawn(async move {
-            while let Ok(message) = msg_rx.recv().await {
-                if let Err(e) = handler::handle_message(
-                    message,
-                    &ingestors,
-                    reconnect_tx.clone(),
-                    c_cursor.clone(),
-                )
-                .await
-                {
-                    error!("jetstream handler error: {e}");
-                }
-            }
-        });
-
-        let cursor_connect = cursor.clone();
-        tokio::spawn(async move {
-            if let Err(e) = jetstream.connect(cursor_connect).await {
-                error!("jetstream connection failed: {e}");
-            }
+            emote_fn: self.emote_fn(),
         });
 
         info!(
             jetstream = %self.jetstream_url,
             streamers = ?self.streamers,
-            did = %xrpc.did(),
+            did = %shared.xrpc.did(),
             "connected to streamplace"
         );
+
+        tokio::spawn(async move {
+            let client = TungsteniteSubscriptionClient::from_base_uri(base_uri);
+            let params = RawJetstreamParams::new()
+                .wanted_collections(vec![
+                    CowStr::from(COLLECTION),
+                    CowStr::from(FOLLOW_COLLECTION),
+                    CowStr::from(TELEPORT_COLLECTION),
+                ])
+                .build();
+
+            loop {
+                let stream = match client.subscribe(&params).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!("jetstream connect failed: {e}");
+                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                        continue;
+                    }
+                };
+
+                let (_sink, mut messages) = stream.into_stream();
+
+                loop {
+                    match messages.next().await {
+                        Some(Ok(msg)) => handle_message(msg, &shared).await,
+                        Some(Err(e)) => {
+                            error!("jetstream stream error: {e}");
+                            break;
+                        }
+                        None => break,
+                    }
+                }
+
+                info!("jetstream disconnected, reconnecting in 5s");
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            }
+        });
 
         Ok(())
     }
 }
 
-struct ChatMessageIngestor {
-    shared: Arc<SharedState>,
-    emote_fn: Arc<dyn Fn(&str) -> String + Send + Sync>,
+fn jetstream_base_uri(url: &str) -> Result<Uri<String>, ParseError> {
+    let without_scheme = url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_start_matches("wss://")
+        .trim_start_matches("ws://");
+    let host = without_scheme.split('/').next().unwrap_or(without_scheme);
+    Uri::parse(format!("wss://{host}")).map_err(|(e, _)| e)
 }
 
-#[async_trait]
-impl LexiconIngestor for ChatMessageIngestor {
-    async fn ingest(&self, message: Event<serde_json::Value>) -> anyhow::Result<()> {
-        let commit = match &message.commit {
-            Some(c) => c,
-            None => return Ok(()),
-        };
+async fn handle_message(msg: RawJetstreamMessage<'static>, shared: &Arc<SharedState>) {
+    let RawJetstreamMessage::Commit { did, commit, .. } = msg else {
+        return;
+    };
+    if !matches!(commit.operation, CommitOperation::Create) {
+        return;
+    }
+    let collection = commit.collection.to_string();
+    let Some(record) = commit.record else { return };
+    let rkey = commit.rkey.to_string();
+    let did_str = did.to_string();
+    match collection.as_str() {
+        COLLECTION => handle_chat_message(did_str, rkey, record, shared).await,
+        FOLLOW_COLLECTION => handle_follow(did_str, record, shared).await,
+        TELEPORT_COLLECTION => handle_teleport(did_str, record, shared).await,
+        _ => {}
+    }
+}
 
-        if !matches!(commit.operation, Operation::Create) {
-            return Ok(());
-        }
+fn raw_str<'a>(data: &'a RawData<'_>, key: &str) -> Option<&'a str> {
+    data.as_object()?.get(key)?.as_str()
+}
 
-        let record = match &commit.record {
-            Some(r) => r,
-            None => return Ok(()),
-        };
+fn raw_to_usize(v: &RawData<'_>) -> Option<usize> {
+    match v {
+        RawData::UnsignedInt(n) => Some(*n as usize),
+        RawData::SignedInt(n) if *n >= 0 => Some(*n as usize),
+        _ => None,
+    }
+}
 
-        let streamer = match record.get("streamer").and_then(|v| v.as_str()) {
-            Some(s) => s,
-            None => return Ok(()),
-        };
+fn parse_raw_facets(arr: &[RawData<'_>]) -> Vec<Facet> {
+    arr.iter()
+        .filter_map(|raw| {
+            let obj = raw.as_object()?;
+            let index_obj = obj.get("index")?.as_object()?;
+            let byte_start = raw_to_usize(index_obj.get("byteStart")?)?;
+            let byte_end = raw_to_usize(index_obj.get("byteEnd")?)?;
+            let features = obj
+                .get("features")?
+                .as_array()?
+                .iter()
+                .filter_map(|f| {
+                    let fobj = f.as_object()?;
+                    let type_ = fobj.get("$type")?.as_str()?.to_string();
+                    let did = fobj
+                        .get("did")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let uri = fobj
+                        .get("uri")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    Some(FacetFeature { type_, did, uri })
+                })
+                .collect();
+            Some(Facet {
+                index: ByteSlice {
+                    byte_start,
+                    byte_end,
+                },
+                features,
+            })
+        })
+        .collect()
+}
 
-        if !self.shared.streamers.contains(streamer) {
-            return Ok(());
-        }
+async fn handle_chat_message(did: String, rkey: String, record: RawData<'static>, shared: &Arc<SharedState>) {
+    let streamer = match raw_str(&record, "streamer") {
+        Some(s) => s.to_string(),
+        None => return,
+    };
+    if !shared.streamers.contains(&streamer) {
+        return;
+    }
 
-        let mut text = match record.get("text").and_then(|v| v.as_str()) {
-            Some(t) => t.to_string(),
-            None => return Ok(()),
-        };
+    let mut text = match raw_str(&record, "text") {
+        Some(t) => t.to_string(),
+        None => return,
+    };
 
-        let facets: Vec<Facet> = record
-            .get("facets")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
+    let facets: Vec<Facet> = record
+        .as_object()
+        .and_then(|obj| obj.get("facets"))
+        .and_then(|v| v.as_array())
+        .map(|arr| parse_raw_facets(arr))
+        .unwrap_or_default();
 
-        if !facets.is_empty() {
-            let mut sorted = facets;
-            sorted.sort_by(|a, b| b.index.byte_start.cmp(&a.index.byte_start));
-
-            for facet in sorted {
-                for feature in &facet.features {
-                    match feature.type_.as_str() {
-                        "app.bsky.richtext.facet#mention" => {
-                            if let Some(did) = &feature.did {
-                                if let Some(handle) =
-                                    self.shared.user_cache.resolve_handle(did).await
-                                {
-                                    if let Some(replaced) = replace_byte_range(
-                                        &text,
-                                        facet.index.byte_start,
-                                        facet.index.byte_end,
-                                        &format!("@{handle}"),
-                                    ) {
-                                        text = replaced;
-                                    }
-                                }
+    if !facets.is_empty() {
+        let mut sorted = facets;
+        sorted.sort_by(|a, b| b.index.byte_start.cmp(&a.index.byte_start));
+        for facet in sorted {
+            for feature in &facet.features {
+                if feature.type_ == "app.bsky.richtext.facet#mention" {
+                    if let Some(mention_did) = &feature.did {
+                        if let Some(handle) = shared.user_cache.resolve_handle(mention_did).await {
+                            if let Some(replaced) = replace_byte_range(
+                                &text,
+                                facet.index.byte_start,
+                                facet.index.byte_end,
+                                &format!("@{handle}"),
+                            ) {
+                                text = replaced;
                             }
                         }
-                        _ => {}
                     }
                 }
             }
         }
+    }
 
-        let did = message.did.clone();
-        let display_name = self.shared.user_cache.resolve_handle(&did).await;
-        info!(did = %did, streamer, text = %text, "received chat message");
-        let streamer_for_reply = streamer.to_string();
-        let xrpc = self.shared.xrpc.clone();
-        let user_cache = self.shared.user_cache.clone();
+    let display_name = shared.user_cache.resolve_handle(&did).await;
+    info!(did = %did, streamer = %streamer, text = %text, "received chat message");
+    let xrpc = shared.xrpc.clone();
+    let user_cache = shared.user_cache.clone();
+    let streamer_for_reply = streamer.clone();
 
-        let (reply_tx, mut reply_rx) = mpsc::channel::<OutgoingMessage>(8);
-
-        tokio::spawn(async move {
-            while let Some(msg) = reply_rx.recv().await {
-                let facets = build_outgoing_facets(&msg.text, &user_cache).await;
-                if let Err(e) = xrpc.send_chat_message(&msg.text, &streamer_for_reply, facets).await {
-                    error!("failed to send reply: {e}");
-                }
+    let (reply_tx, mut reply_rx) = mpsc::channel::<OutgoingMessage>(8);
+    tokio::spawn(async move {
+        while let Some(msg) = reply_rx.recv().await {
+            let facets = build_outgoing_facets(&msg.text, &user_cache).await;
+            if let Err(e) = xrpc
+                .send_chat_message(&msg.text, &streamer_for_reply, facets)
+                .await
+            {
+                error!("failed to send reply: {e}");
             }
-        });
+        }
+    });
 
-        let event = tweezer::Event::Message(
-            IncomingMessage::new(
-                "streamplace",
-                User {
-                    name: did.clone(),
-                    id: did,
-                    display_name,
-                },
-                text,
-                streamer,
-                reply_tx,
-                self.emote_fn.clone(),
-            )
-            .max_reply_graphemes(300),
-        );
+    let xrpc_for_delete = shared.xrpc.clone();
+    let event = tweezer::Event::Message(
+        IncomingMessage::new(
+            "streamplace",
+            User {
+                name: did.clone(),
+                id: did,
+                display_name,
+            },
+            text,
+            streamer,
+            reply_tx,
+            shared.emote_fn.clone(),
+        )
+        .max_reply_graphemes(300)
+        .message_id(&rkey)
+        .on_delete(move || {
+            let xrpc = xrpc_for_delete.clone();
+            let rkey = rkey.clone();
+            async move {
+                xrpc.delete_chat_message(&rkey)
+                    .await
+                    .map_err(|e| tweezer::TweezerError::Handler(e))
+            }
+        }),
+    );
+    shared.bot_tx.send(event).await.ok();
+}
 
-        self.shared.bot_tx.send(event).await.ok();
-
-        Ok(())
+async fn handle_follow(did: String, record: RawData<'static>, shared: &Arc<SharedState>) {
+    let subject = match raw_str(&record, "subject") {
+        Some(s) => s.to_string(),
+        None => return,
+    };
+    if !shared.streamers.contains(&subject) {
+        return;
     }
+
+    let display_name = shared.user_cache.resolve_handle(&did).await;
+    info!(follower = %did, streamer = %subject, "follow event");
+
+    let xrpc = shared.xrpc.clone();
+    let user_cache = shared.user_cache.clone();
+    let subject_for_reply = subject.clone();
+    let (reply_tx, mut reply_rx) = mpsc::channel::<OutgoingMessage>(8);
+    tokio::spawn(async move {
+        while let Some(msg) = reply_rx.recv().await {
+            let facets = build_outgoing_facets(&msg.text, &user_cache).await;
+            if let Err(e) = xrpc
+                .send_chat_message(&msg.text, &subject_for_reply, facets)
+                .await
+            {
+                error!("failed to send follow reply: {e}");
+            }
+        }
+    });
+
+    let event = tweezer::Event::Trigger(TriggerEvent::new(
+        "streamplace",
+        subject,
+        TriggerKind::Follow {
+            user: User {
+                name: did.clone(),
+                id: did,
+                display_name,
+            },
+        },
+        reply_tx,
+        Arc::new(|name| format!(":{}:", name)),
+    ));
+    shared.bot_tx.send(event).await.ok();
 }
 
-struct FollowIngestor {
-    shared: Arc<SharedState>,
-}
-
-#[async_trait]
-impl LexiconIngestor for FollowIngestor {
-    async fn ingest(&self, message: Event<serde_json::Value>) -> anyhow::Result<()> {
-        let commit = match &message.commit {
-            Some(c) => c,
-            None => return Ok(()),
-        };
-
-        if !matches!(commit.operation, Operation::Create) {
-            return Ok(());
-        }
-
-        let record = match &commit.record {
-            Some(r) => r,
-            None => return Ok(()),
-        };
-
-        let subject = match record.get("subject").and_then(|v| v.as_str()) {
-            Some(s) => s,
-            None => return Ok(()),
-        };
-
-        if !self.shared.streamers.contains(subject) {
-            return Ok(());
-        }
-
-        let follower_did = message.did.clone();
-        let display_name = self.shared.user_cache.resolve_handle(&follower_did).await;
-        info!(follower = %follower_did, streamer = subject, "follow event");
-
-        let (reply_tx, _) = mpsc::channel::<OutgoingMessage>(1);
-
-        let event = tweezer::Event::Trigger(
-            TriggerEvent::new(
-                "streamplace",
-                subject,
-                TriggerKind::Follow {
-                    user: User {
-                        name: follower_did.clone(),
-                        id: follower_did,
-                        display_name,
-                    },
-                },
-                reply_tx,
-                Arc::new(|name| format!(":{}:", name)),
-            ),
-        );
-
-        self.shared.bot_tx.send(event).await.ok();
-
-        Ok(())
+async fn handle_teleport(did: String, record: RawData<'static>, shared: &Arc<SharedState>) {
+    let streamer = match raw_str(&record, "streamer") {
+        Some(s) => s.to_string(),
+        None => return,
+    };
+    if !shared.streamers.contains(&streamer) {
+        return;
     }
-}
 
-struct TeleportIngestor {
-    shared: Arc<SharedState>,
-}
+    info!(raider = %did, streamer = %streamer, "teleport/raid event");
 
-#[async_trait]
-impl LexiconIngestor for TeleportIngestor {
-    async fn ingest(&self, message: Event<serde_json::Value>) -> anyhow::Result<()> {
-        let commit = match &message.commit {
-            Some(c) => c,
-            None => return Ok(()),
-        };
-
-        if !matches!(commit.operation, Operation::Create) {
-            return Ok(());
+    let xrpc = shared.xrpc.clone();
+    let user_cache = shared.user_cache.clone();
+    let streamer_for_reply = streamer.clone();
+    let (reply_tx, mut reply_rx) = mpsc::channel::<OutgoingMessage>(8);
+    tokio::spawn(async move {
+        while let Some(msg) = reply_rx.recv().await {
+            let facets = build_outgoing_facets(&msg.text, &user_cache).await;
+            if let Err(e) = xrpc
+                .send_chat_message(&msg.text, &streamer_for_reply, facets)
+                .await
+            {
+                error!("failed to send raid reply: {e}");
+            }
         }
+    });
 
-        let record = match &commit.record {
-            Some(r) => r,
-            None => return Ok(()),
-        };
-
-        let streamer = match record.get("streamer").and_then(|v| v.as_str()) {
-            Some(s) => s,
-            None => return Ok(()),
-        };
-
-        if !self.shared.streamers.contains(streamer) {
-            return Ok(());
-        }
-
-        let raider_did = message.did.clone();
-        let _display_name = self.shared.user_cache.resolve_handle(&raider_did).await;
-        info!(raider = %raider_did, streamer, "teleport/raid event");
-
-        let (reply_tx, _) = mpsc::channel::<OutgoingMessage>(1);
-
-        let event = tweezer::Event::Trigger(
-            TriggerEvent::new(
-                "streamplace",
-                streamer,
-                TriggerKind::Raid {
-                    from_channel: raider_did.clone(),
-                    viewer_count: None,
-                },
-                reply_tx,
-                Arc::new(|name| format!(":{}:", name)),
-            ),
-        );
-
-        self.shared.bot_tx.send(event).await.ok();
-
-        Ok(())
-    }
+    let event = tweezer::Event::Trigger(TriggerEvent::new(
+        "streamplace",
+        streamer,
+        TriggerKind::Raid {
+            from_channel: did.clone(),
+            viewer_count: None,
+        },
+        reply_tx,
+        Arc::new(|name| format!(":{}:", name)),
+    ));
+    shared.bot_tx.send(event).await.ok();
 }
 
 async fn build_outgoing_facets(text: &str, cache: &UserCache) -> Option<Vec<OutgoingFacet>> {
@@ -531,16 +548,26 @@ async fn build_outgoing_facets(text: &str, cache: &UserCache) -> Option<Vec<Outg
     let mut facets = Vec::with_capacity(scanned.len());
     for s in scanned {
         match s {
-            ScannedFacet::Mention { byte_start, byte_end, handle } => {
+            ScannedFacet::Mention {
+                byte_start,
+                byte_end,
+                handle,
+            } => {
                 if let Some(did) = cache.resolve_did(&handle).await {
                     facets.push(OutgoingFacet::mention(byte_start, byte_end, did));
                 }
             }
-            ScannedFacet::Link { byte_start, byte_end } => {
+            ScannedFacet::Link {
+                byte_start,
+                byte_end,
+            } => {
                 let url = text[byte_start..byte_end].to_string();
                 facets.push(OutgoingFacet::link(byte_start, byte_end, url));
             }
-            ScannedFacet::BareLink { byte_start, byte_end } => {
+            ScannedFacet::BareLink {
+                byte_start,
+                byte_end,
+            } => {
                 let domain = &text[byte_start..byte_end];
                 let url = format!("https://{}", domain);
                 facets.push(OutgoingFacet::link(byte_start, byte_end, url));
@@ -559,8 +586,7 @@ fn replace_byte_range(s: &str, start: usize, end: usize, replacement: &str) -> O
     if start > end || end > s.len() || !s.is_char_boundary(start) || !s.is_char_boundary(end) {
         return None;
     }
-    let mut result =
-        String::with_capacity(s.len() - (end - start) + replacement.len());
+    let mut result = String::with_capacity(s.len() - (end - start) + replacement.len());
     result.push_str(&s[..start]);
     result.push_str(replacement);
     result.push_str(&s[end..]);
@@ -686,7 +712,11 @@ mod tests {
         let facets = scan_text_facets("hello @alice.bsky.social world");
         assert_eq!(facets.len(), 1);
         match &facets[0] {
-            ScannedFacet::Mention { byte_start, byte_end, handle } => {
+            ScannedFacet::Mention {
+                byte_start,
+                byte_end,
+                handle,
+            } => {
                 assert_eq!(*byte_start, 6);
                 assert_eq!(*byte_end, 24);
                 assert_eq!(handle, "alice.bsky.social");
@@ -700,7 +730,10 @@ mod tests {
         let facets = scan_text_facets("check https://example.com out");
         assert_eq!(facets.len(), 1);
         match &facets[0] {
-            ScannedFacet::Link { byte_start, byte_end } => {
+            ScannedFacet::Link {
+                byte_start,
+                byte_end,
+            } => {
                 assert_eq!(*byte_start, 6);
                 assert_eq!(*byte_end, 25);
             }
@@ -731,7 +764,10 @@ mod tests {
         let facets = scan_text_facets("check github.com out");
         assert_eq!(facets.len(), 1);
         match &facets[0] {
-            ScannedFacet::BareLink { byte_start, byte_end } => {
+            ScannedFacet::BareLink {
+                byte_start,
+                byte_end,
+            } => {
                 assert_eq!(*byte_start, 6);
                 assert_eq!(*byte_end, 16);
             }
@@ -744,7 +780,10 @@ mod tests {
         let facets = scan_text_facets("see docs.rs/some-crate");
         assert_eq!(facets.len(), 1);
         match &facets[0] {
-            ScannedFacet::BareLink { byte_start, byte_end } => {
+            ScannedFacet::BareLink {
+                byte_start,
+                byte_end,
+            } => {
                 assert_eq!(*byte_start, 4);
                 assert_eq!(*byte_end, 22);
             }
@@ -784,7 +823,11 @@ mod tests {
         let facets = scan_text_facets(text);
         assert_eq!(facets.len(), 1);
         match &facets[0] {
-            ScannedFacet::Mention { byte_start, byte_end, handle } => {
+            ScannedFacet::Mention {
+                byte_start,
+                byte_end,
+                handle,
+            } => {
                 assert_eq!(*byte_start, 3);
                 assert_eq!(*byte_end, 21);
                 assert_eq!(handle, "alice.bsky.social");
@@ -798,7 +841,10 @@ mod tests {
         let facets = scan_text_facets("see http://example.com");
         assert_eq!(facets.len(), 1);
         match &facets[0] {
-            ScannedFacet::Link { byte_start, byte_end } => {
+            ScannedFacet::Link {
+                byte_start,
+                byte_end,
+            } => {
                 assert_eq!(*byte_start, 4);
                 assert_eq!(*byte_end, 22);
             }

@@ -1,0 +1,10 @@
+pub mod ffxiv;
+pub mod games;
+pub mod genshin;
+pub mod metar;
+pub mod pokemon;
+pub mod poll_commands;
+pub mod polls;
+pub mod quotes;
+pub mod reminders;
+pub mod translate;

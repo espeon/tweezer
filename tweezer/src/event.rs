@@ -1,8 +1,8 @@
-use std::sync::Arc;
+use std::{future::Future, pin::Pin, sync::Arc};
 
 use tokio::sync::mpsc::Sender;
 
-use crate::{OutgoingMessage, User};
+use crate::{OutgoingMessage, TweezerError, User};
 
 pub enum Event {
     Message(IncomingMessage),
@@ -22,6 +22,10 @@ pub enum LifecycleKind {
     Ready,
 }
 
+type DeleteFn = Arc<
+    dyn Fn() -> Pin<Box<dyn Future<Output = Result<(), TweezerError>> + Send>> + Send + Sync,
+>;
+
 pub struct IncomingMessage {
     pub(crate) platform: String,
     pub(crate) user: User,
@@ -30,6 +34,8 @@ pub struct IncomingMessage {
     pub(crate) reply_tx: Sender<OutgoingMessage>,
     pub(crate) emote_fn: Arc<dyn Fn(&str) -> String + Send + Sync>,
     pub(crate) max_reply_graphemes: Option<usize>,
+    pub(crate) message_id: Option<String>,
+    pub(crate) delete_fn: Option<DeleteFn>,
 }
 
 impl IncomingMessage {
@@ -49,11 +55,27 @@ impl IncomingMessage {
             reply_tx,
             emote_fn,
             max_reply_graphemes: None,
+            message_id: None,
+            delete_fn: None,
         }
     }
 
     pub fn max_reply_graphemes(mut self, n: usize) -> Self {
         self.max_reply_graphemes = Some(n);
+        self
+    }
+
+    pub fn message_id(mut self, id: impl Into<String>) -> Self {
+        self.message_id = Some(id.into());
+        self
+    }
+
+    pub fn on_delete<F, Fut>(mut self, f: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), TweezerError>> + Send + 'static,
+    {
+        self.delete_fn = Some(Arc::new(move || Box::pin(f())));
         self
     }
 }

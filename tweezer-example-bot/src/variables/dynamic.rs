@@ -1,59 +1,60 @@
-use std::{
-    collections::HashMap,
-    sync::{Arc, RwLock},
-};
+use std::sync::Arc;
 
 use tweezer::Context;
 
-use super::{Expander, store::CommandStore};
+use super::Expander;
+use crate::db::Database;
 
 #[derive(Clone)]
 pub struct DynamicCommands {
-    commands: Arc<RwLock<HashMap<String, String>>>,
+    db: Option<Database>,
     expander: Arc<Expander>,
-    store: Option<Arc<dyn CommandStore>>,
 }
 
 impl DynamicCommands {
     pub fn new(expander: Arc<Expander>) -> Self {
         Self {
-            commands: Arc::new(RwLock::new(HashMap::new())),
+            db: None,
             expander,
-            store: None,
         }
     }
 
-    pub fn with_store(mut self, store: impl CommandStore + 'static) -> Self {
-        let store = Arc::new(store);
-        if let Ok(commands) = store.load() {
-            *self.commands.write().unwrap() = commands;
-        }
-        self.store = Some(store);
+    pub fn with_db(mut self, db: Database) -> Self {
+        self.db = Some(db);
         self
     }
 
     pub fn add(&self, name: &str, template: &str) {
-        self.commands.write().unwrap().insert(name.to_string(), template.to_string());
-        self.persist();
+        if let Some(ref db) = self.db {
+            if let Err(e) = db.cmd_add(name, template) {
+                tracing::warn!("failed to persist command: {e}");
+            }
+        }
     }
 
     pub fn remove(&self, name: &str) -> bool {
-        let removed = self.commands.write().unwrap().remove(name).is_some();
-        if removed {
-            self.persist();
+        if let Some(ref db) = self.db {
+            match db.cmd_remove(name) {
+                Ok(removed) => removed,
+                Err(e) => {
+                    tracing::warn!("failed to remove command: {e}");
+                    false
+                }
+            }
+        } else {
+            false
         }
-        removed
     }
 
     pub fn get(&self, name: &str) -> Option<String> {
-        self.commands.read().unwrap().get(name).cloned()
+        self.db.as_ref()?.cmd_get(name).unwrap_or(None)
     }
 
     pub fn list(&self) -> Vec<String> {
-        let map = self.commands.read().unwrap();
-        let mut names: Vec<String> = map.keys().cloned().collect();
-        names.sort();
-        names
+        match self.db {
+            Some(ref db) => db.cmd_list().unwrap_or_default().into_iter().map(|(n, _)| n).collect(),
+            None => Vec::new(),
+        }
     }
 
     pub async fn try_dispatch(&self, message: &str, ctx: &Context) -> Option<String> {
@@ -61,15 +62,6 @@ impl DynamicCommands {
         let cmd_name = rest.split_whitespace().next()?;
         let template = self.get(cmd_name)?;
         Some(self.expander.expand(&template, ctx, cmd_name).await)
-    }
-
-    fn persist(&self) {
-        if let Some(ref store) = self.store {
-            let commands = self.commands.read().unwrap();
-            if let Err(e) = store.save(&commands) {
-                tracing::warn!("failed to persist commands: {e}");
-            }
-        }
     }
 }
 
@@ -80,6 +72,7 @@ mod tests {
     use tweezer::{OutgoingMessage, TypeMap, User};
 
     use super::*;
+    use crate::db::Database;
 
     fn make_ctx(user: &str) -> Context {
         let (tx, _) = mpsc::channel::<OutgoingMessage>(1);
@@ -96,7 +89,8 @@ mod tests {
     }
 
     fn make_dc() -> DynamicCommands {
-        DynamicCommands::new(Arc::new(Expander::new()))
+        let db = Database::open_in_memory().unwrap();
+        DynamicCommands::new(Arc::new(Expander::new())).with_db(db)
     }
 
     #[test]

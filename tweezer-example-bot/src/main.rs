@@ -1,168 +1,17 @@
+mod commands;
+mod db;
 mod variables;
+mod web;
 
 use std::collections::HashSet;
 
 use tracing::info;
 use tweezer::{Bot, Command, Context};
+use tweezer::command;
 use tweezer_streamplace::StreamplaceAdapter;
 
-use variables::{DynamicCommands, Expander, FileStore};
-
-#[derive(serde::Deserialize)]
-struct Cloud {
-    cover: String,
-}
-
-#[derive(serde::Deserialize)]
-struct MetarResponse {
-    #[serde(rename = "rawOb")]
-    raw_ob: String,
-    name: Option<String>,
-    temp: Option<f64>,
-    dewp: Option<f64>,
-    wdir: Option<i32>,
-    wspd: Option<i32>,
-    wgust: Option<i32>,
-    visib: Option<String>,
-    clouds: Option<Vec<Cloud>>,
-}
-
-impl MetarResponse {
-    fn plain(&self) -> String {
-        let mut s = String::new();
-
-        if let Some(ref name) = self.name {
-            s.push_str(name);
-            s.push_str(": ");
-        }
-
-        if let Some(t) = self.temp {
-            let f = t * 9.0 / 5.0 + 32.0;
-            let temp_desc = describe_temp(f);
-            s.push_str(&format!("{temp_desc} ({:.0}°F)", f));
-            if let Some(d) = self.dewp {
-                let df = d * 9.0 / 5.0 + 32.0;
-                let spread = f - df;
-                if spread < 5.0 {
-                    s.push_str(", pretty humid out");
-                } else if spread > 30.0 {
-                    s.push_str(", air is real dry though");
-                }
-            }
-            s.push_str(". ");
-        }
-
-        if let (Some(dir), Some(spd)) = (self.wdir, self.wspd) {
-            if spd == 0 {
-                s.push_str("Not much wind right now. ");
-            } else {
-                let cardinal = dir_to_cardinal(dir);
-                s.push_str(&format!("Wind coming out of the {cardinal} at {spd} kt"));
-                if let Some(gust) = self.wgust {
-                    if gust > 0 {
-                        s.push_str(&format!(", gusting to {gust}"));
-                    }
-                }
-                s.push('.');
-                if spd >= 25 || self.wgust.map_or(false, |g| g >= 35) {
-                    s.push_str(" Hold onto your hat.");
-                } else if spd >= 15 {
-                    s.push_str(" Bit of a breeze.");
-                }
-                s.push(' ');
-            }
-        }
-
-        if let Some(ref vis) = self.visib {
-            if vis.contains("10") || vis.contains("9999") {
-                s.push_str("Visibility is good. ");
-            } else if vis.starts_with('<') || vis.starts_with('0') {
-                s.push_str("Pretty socked in out there. ");
-            } else {
-                s.push_str(&format!("Visibility around {vis} statute miles. "));
-            }
-        }
-
-        if let Some(ref layers) = self.clouds {
-            if layers.is_empty() {
-                s.push_str("Clear skies.");
-            } else {
-                let sky: &str = match layers.last().map(|c| c.cover.as_str()).unwrap_or("") {
-                    "SKC" | "CLR" => "Clear skies.",
-                    "FEW" => "Just a few clouds hanging around.",
-                    "SCT" => "Broken up clouds, some sun getting through.",
-                    "BKN" => "Pretty overcast.",
-                    "OVC" => "Full grey blanket overhead.",
-                    _ => "Some cloud cover up there.",
-                };
-                s.push_str(sky);
-            }
-        }
-
-        let trimmed = s.trim();
-        if trimmed.is_empty() {
-            self.raw_ob.clone()
-        } else {
-            trimmed.to_string()
-        }
-    }
-}
-
-fn describe_temp(f: f64) -> &'static str {
-    if f < 20.0 {
-        "Dangerously cold"
-    } else if f < 35.0 {
-        "Bitterly cold"
-    } else if f < 50.0 {
-        "Pretty chilly"
-    } else if f < 60.0 {
-        "On the cool side"
-    } else if f < 70.0 {
-        "Comfortable"
-    } else if f < 80.0 {
-        "Nice and warm"
-    } else if f < 90.0 {
-        "Getting pretty warm"
-    } else if f < 100.0 {
-        "Straight up hot"
-    } else {
-        "Dangerously hot"
-    }
-}
-
-fn dir_to_cardinal(deg: i32) -> &'static str {
-    match deg {
-        338..=360 | 0..=22 => "north",
-        23..=67 => "northeast",
-        68..=112 => "east",
-        113..=157 => "southeast",
-        158..=202 => "south",
-        203..=247 => "southwest",
-        248..=292 => "west",
-        293..=337 => "northwest",
-        _ => "unknown",
-    }
-}
-
-async fn fetch_metar(icao: &str) -> Result<MetarResponse, tweezer::TweezerError> {
-    let url = format!("https://aviationweather.gov/api/data/metar?ids={icao}&format=json");
-    let client = reqwest::Client::new();
-    let resp: Vec<MetarResponse> = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| tweezer::TweezerError::Connection(e.to_string()))?
-        .json()
-        .await
-        .map_err(|e| tweezer::TweezerError::Connection(e.to_string()))?;
-
-    match resp.into_iter().next() {
-        Some(m) => Ok(m),
-        None => Err(tweezer::TweezerError::Trigger(format!(
-            "no METAR found for {icao}"
-        ))),
-    }
-}
+use db::Database;
+use variables::{DynamicCommands, Expander, QuotesDb};
 
 /// User IDs allowed to add/remove dynamic commands.
 pub struct Moderators(pub HashSet<String>);
@@ -195,89 +44,80 @@ async fn main() {
     let mut adapter = StreamplaceAdapter::new(jetstream_url, identifier, password);
     adapter.add_streamers(streamer_dids.clone());
 
+    let db_path = std::env::var("DATABASE_PATH").unwrap_or_else(|_| "bot.db".into());
+    let database = Database::open(&db_path).expect("failed to open database");
+
     let mut bot = Bot::new();
 
+    let expander = std::sync::Arc::new(Expander::with_db(database.clone()));
     bot.register(
-        DynamicCommands::new(std::sync::Arc::new(Expander::new()))
-            .with_store(FileStore::new("commands.json")),
+        DynamicCommands::new(expander.clone())
+            .with_db(database.clone()),
     );
     bot.register(Moderators(streamer_dids.into_iter().collect()));
 
+    // Register shared state for commands that need it
+    bot.register(commands::pokemon::PokemonCache::new());
+    bot.register(commands::pokemon::TypeChartCache::new());
+    bot.register(QuotesDb::new().with_db(database.clone()));
+    bot.register(commands::polls::PollManager::new());
+
+    let reminder_mgr = commands::reminders::ReminderManager::new(database.clone());
+    bot.register(reminder_mgr.clone());
+
     // ---------------------------------------------------------------------------
-    // Static commands
+    // Static commands (declarative via #[command])
     // ---------------------------------------------------------------------------
 
-    bot.add_command(
-        Command::new(
-            "ping",
-            |ctx: Context| async move { ctx.reply("pong").await },
+    #[command(category = "general")]
+    /// responds with pong
+    async fn ping(ctx: Context) -> Result<(), tweezer::TweezerError> {
+        ctx.reply("pong").await
+    }
+
+    #[command(category = "general")]
+    /// let everyone know you're going quiet
+    async fn lurk(ctx: Context) -> Result<(), tweezer::TweezerError> {
+        let name = ctx.user().display().to_string();
+        info!("{name} is lurking");
+        ctx.reply(&format!("@{name} is now lurking")).await
+    }
+
+    #[command(category = "general")]
+    /// wat
+    async fn wat(ctx: Context) -> Result<(), tweezer::TweezerError> {
+        let name = ctx.user().display().to_string();
+        ctx.reply(&format!("@{name} z.ai https://github.com")).await
+    }
+
+    #[command(
+        name = "timer",
+        description = "what is the timer?",
+        category = "streamplace",
+        channel = "did:plc:2zmxikig2sj7gqaezl5gntae"
+    )]
+    async fn timer_cmd(ctx: Context) -> Result<(), tweezer::TweezerError> {
+        ctx.reply(
+            "The timer counts down to Unix time 173173173173.173. \
+             173 on an upside-down calculator spells Eli.",
         )
-        .description("responds with pong")
-        .category("general"),
-    );
+        .await
+    }
 
-    bot.add_command(
-        Command::new("lurk", |ctx: Context| {
-            let name = ctx.user().display().to_string();
-            async move {
-                info!("{name} is lurking");
-                ctx.reply(&format!("@{name} is now lurking")).await
-            }
-        })
-        .description("let everyone know you're going quiet")
-        .category("general"),
-    );
+    bot.add_command(ping());
+    bot.add_command(lurk());
+    bot.add_command(wat());
+    bot.add_command(timer_cmd());
 
-    bot.add_command(
-        Command::new("wat", |ctx: Context| {
-            let name = ctx.user().display().to_string();
-            async move { ctx.reply(&format!("@{name} z.ai https://github.com")).await }
-        })
-        .description("wat")
-        .category("general"),
-    );
-
-    bot.add_command(
-        Command::new("metar", |ctx: Context| {
-            let icao = ctx.args().first().cloned();
-            let plain = ctx.args().get(1).map(|s| s.as_str()) == Some("plain");
-            async move {
-                let icao = match icao {
-                    Some(code) => code.to_uppercase(),
-                    None => {
-                        return ctx
-                            .reply("usage: !metar <icao> [plain]  (e.g. !metar KMCI)")
-                            .await;
-                    }
-                };
-                if !icao.chars().all(|c| c.is_ascii_alphabetic()) || icao.len() != 4 {
-                    return ctx.reply("ICAO codes are 4 letters, e.g. KMCI").await;
-                }
-                match fetch_metar(&icao).await {
-                    Ok(metar) => {
-                        let text = if plain { metar.plain() } else { metar.raw_ob };
-                        ctx.reply(&text).await
-                    }
-                    Err(e) => ctx.reply(&format!("error: {e}")).await,
-                }
-            }
-        })
-        .description("fetch current METAR for an airport (e.g. !metar KMCI or !metar KLAX plain)")
-        .category("aviation"),
-    );
-
-    bot.add_command(
-        Command::new("timer", |ctx: Context| async move {
-            ctx.reply(
-                "The timer counts down to Unix time 173173173173.173. \
-                 173 on an upside-down calculator spells Eli.",
-            )
-            .await
-        })
-        .description("what is the timer?")
-        .category("streamplace")
-        .channel("did:web:stream.place"),
-    );
+    commands::games::add_commands(&mut bot);
+    commands::pokemon::add_command(&mut bot);
+    commands::ffxiv::add_command(&mut bot);
+    commands::genshin::add_command(&mut bot);
+    commands::metar::add_command(&mut bot);
+    commands::quotes::add_commands(&mut bot);
+    commands::poll_commands::add_commands(&mut bot);
+    commands::translate::add_command(&mut bot);
+    commands::reminders::add_commands(&mut bot);
 
     // ---------------------------------------------------------------------------
     // Dynamic command management
@@ -285,12 +125,6 @@ async fn main() {
 
     bot.add_command(
         Command::new("addcmd", |ctx: Context| async move {
-            let mods = ctx
-                .state::<Moderators>()
-                .expect("Moderators not registered");
-            if !mods.contains(ctx.user().name.as_str()) {
-                return ctx.reply("only the streamer can add commands").await;
-            }
             let dc = ctx
                 .state::<DynamicCommands>()
                 .expect("DynamicCommands not registered");
@@ -306,17 +140,19 @@ async fn main() {
             ctx.reply(&format!("command !{name} added")).await
         })
         .description("add a dynamic command: !addcmd !name template")
-        .category("moderation"),
+        .category("moderation")
+        .check(|ctx| async move {
+            ctx.state::<Moderators>()
+                .map(|m| m.contains(ctx.user().name.as_str()))
+                .unwrap_or(false)
+        })
+        .on_check_fail(|ctx| async move {
+            ctx.reply("only the streamer can add commands").await
+        }),
     );
 
     bot.add_command(
         Command::new("delcmd", |ctx: Context| async move {
-            let mods = ctx
-                .state::<Moderators>()
-                .expect("Moderators not registered");
-            if !mods.contains(ctx.user().name.as_str()) {
-                return ctx.reply("only the streamer can remove commands").await;
-            }
             let dc = ctx
                 .state::<DynamicCommands>()
                 .expect("DynamicCommands not registered");
@@ -331,7 +167,15 @@ async fn main() {
             }
         })
         .description("remove a dynamic command: !delcmd !name")
-        .category("moderation"),
+        .category("moderation")
+        .check(|ctx| async move {
+            ctx.state::<Moderators>()
+                .map(|m| m.contains(ctx.user().name.as_str()))
+                .unwrap_or(false)
+        })
+        .on_check_fail(|ctx| async move {
+            ctx.reply("only the streamer can remove commands").await
+        }),
     );
 
     bot.add_command(
@@ -372,5 +216,23 @@ async fn main() {
     });
 
     bot.add_adapter(adapter);
+
+    // Start reminder background task
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        loop {
+            interval.tick().await;
+            reminder_mgr.check_due().await;
+        }
+    });
+
+    // Start web dashboard
+    let web_db = database.clone();
+    tokio::spawn(async move {
+        if let Err(e) = web::serve(web_db).await {
+            tracing::error!("web dashboard error: {e}");
+        }
+    });
+
     bot.run().await.expect("bot exited with error");
 }

@@ -1,16 +1,18 @@
 mod builtins;
 mod count;
 mod dynamic;
+mod quotes;
 mod store;
 
 pub use dynamic::DynamicCommands;
-pub use store::FileStore;
+pub use quotes::QuotesDb;
 
 use async_trait::async_trait;
 use regex::Regex;
 use std::sync::Arc;
 use tweezer::Context;
 
+use crate::db::Database;
 use builtins::BuiltinProvider;
 use count::CountProvider;
 
@@ -42,6 +44,13 @@ pub struct Expander {
 impl Expander {
     pub fn new() -> Self {
         let count = Arc::new(CountProvider::new());
+        Self {
+            providers: vec![Box::new(BuiltinProvider), Box::new(count)],
+        }
+    }
+
+    pub fn with_db(db: Database) -> Self {
+        let count = Arc::new(CountProvider::new().with_db(db));
         Self {
             providers: vec![Box::new(BuiltinProvider), Box::new(count)],
         }

@@ -24,29 +24,66 @@ type AfterCommandHook = Arc<dyn Fn(Context, String, Result<(), TweezerError>) ->
 type UnrecognizedCommandHook = Arc<dyn Fn(Context, String) -> BoxFuture + Send + Sync>;
 type LifecycleHandler = Arc<dyn Fn(LifecycleKind, String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RateLimitStrategy {
+    FixedWindow,
+    LeakyBucket,
+}
+
+struct LeakyBucketState {
+    water: f64,
+    last_check: Instant,
+}
+
+struct CooldownInner {
+    last_global: Option<Instant>,
+    last_per_user: HashMap<String, Instant>,
+    global_window: Option<(Instant, u32)>,
+    user_windows: HashMap<String, (Instant, u32)>,
+    global_leaky: Option<LeakyBucketState>,
+    user_leaky: HashMap<String, LeakyBucketState>,
+}
+
 struct CooldownState {
     global_cooldown: Option<Duration>,
     user_cooldown: Option<Duration>,
-    last_global: Arc<std::sync::RwLock<Option<Instant>>>,
-    last_per_user: Arc<std::sync::RwLock<HashMap<String, Instant>>>,
+    global_rate: Option<(u32, Duration)>,
+    user_rate: Option<(u32, Duration)>,
+    rate_limit_strategy: RateLimitStrategy,
+    inner: Arc<std::sync::Mutex<CooldownInner>>,
 }
 
 impl CooldownState {
-    fn new(global: Option<Duration>, user: Option<Duration>) -> Self {
+    fn new(
+        global: Option<Duration>,
+        user: Option<Duration>,
+        global_rate: Option<(u32, Duration)>,
+        user_rate: Option<(u32, Duration)>,
+        rate_limit_strategy: RateLimitStrategy,
+    ) -> Self {
         Self {
             global_cooldown: global,
             user_cooldown: user,
-            last_global: Arc::new(std::sync::RwLock::new(None)),
-            last_per_user: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            global_rate,
+            user_rate,
+            rate_limit_strategy,
+            inner: Arc::new(std::sync::Mutex::new(CooldownInner {
+                last_global: None,
+                last_per_user: HashMap::new(),
+                global_window: None,
+                user_windows: HashMap::new(),
+                global_leaky: None,
+                user_leaky: HashMap::new(),
+            })),
         }
     }
 
     fn check_and_mark(&self, user_id: &str) -> bool {
         let now = Instant::now();
+        let mut inner = self.inner.lock().unwrap();
 
         if let Some(dur) = self.global_cooldown {
-            let lock = self.last_global.read().unwrap();
-            if let Some(last) = *lock {
+            if let Some(last) = inner.last_global {
                 if now.duration_since(last) < dur {
                     return false;
                 }
@@ -54,27 +91,106 @@ impl CooldownState {
         }
 
         if let Some(dur) = self.user_cooldown {
-            let lock = self.last_per_user.read().unwrap();
-            if let Some(last) = lock.get(user_id) {
-                if now.duration_since(*last) < dur {
+            if let Some(&last) = inner.last_per_user.get(user_id) {
+                if now.duration_since(last) < dur {
                     return false;
                 }
             }
         }
 
+        match self.rate_limit_strategy {
+            RateLimitStrategy::FixedWindow => {
+                if let Some((max, window)) = self.global_rate {
+                    match inner.global_window {
+                        Some((start, count)) if now.duration_since(start) < window => {
+                            if count >= max {
+                                return false;
+                            }
+                        }
+                        _ => {
+                            inner.global_window = Some((now, 0));
+                        }
+                    }
+                }
+
+                if let Some((max, window)) = self.user_rate {
+                    match inner.user_windows.get(user_id).copied() {
+                        Some((start, count)) if now.duration_since(start) < window => {
+                            if count >= max {
+                                return false;
+                            }
+                        }
+                        _ => {
+                            inner.user_windows.insert(user_id.to_string(), (now, 0));
+                        }
+                    }
+                }
+            }
+            RateLimitStrategy::LeakyBucket => {
+                if let Some((max, window)) = self.global_rate {
+                    let mut bucket = inner.global_leaky.take().unwrap_or_else(|| LeakyBucketState {
+                        water: 0.0,
+                        last_check: now,
+                    });
+                    let elapsed = now.duration_since(bucket.last_check).as_secs_f64();
+                    let leak_rate = max as f64 / window.as_secs_f64();
+                    bucket.water = (bucket.water - elapsed * leak_rate).max(0.0);
+                    bucket.last_check = now;
+
+                    if bucket.water + 1.0 > max as f64 {
+                        inner.global_leaky = Some(bucket);
+                        return false;
+                    }
+                    bucket.water += 1.0;
+                    inner.global_leaky = Some(bucket);
+                }
+
+                if let Some((max, window)) = self.user_rate {
+                    let mut bucket = inner.user_leaky.remove(user_id).unwrap_or_else(|| LeakyBucketState {
+                        water: 0.0,
+                        last_check: now,
+                    });
+                    let elapsed = now.duration_since(bucket.last_check).as_secs_f64();
+                    let leak_rate = max as f64 / window.as_secs_f64();
+                    bucket.water = (bucket.water - elapsed * leak_rate).max(0.0);
+                    bucket.last_check = now;
+
+                    if bucket.water + 1.0 > max as f64 {
+                        inner.user_leaky.insert(user_id.to_string(), bucket);
+                        return false;
+                    }
+                    bucket.water += 1.0;
+                    inner.user_leaky.insert(user_id.to_string(), bucket);
+                }
+            }
+        }
+
         if self.global_cooldown.is_some() {
-            *self.last_global.write().unwrap() = Some(now);
+            inner.last_global = Some(now);
         }
         if self.user_cooldown.is_some() {
-            self.last_per_user.write().unwrap().insert(user_id.to_string(), now);
+            inner.last_per_user.insert(user_id.to_string(), now);
+        }
+        if self.rate_limit_strategy == RateLimitStrategy::FixedWindow {
+            if self.global_rate.is_some() {
+                if let Some((_, count)) = inner.global_window.as_mut() {
+                    *count += 1;
+                }
+            }
+            if self.user_rate.is_some() {
+                if let Some((_, count)) = inner.user_windows.get_mut(user_id) {
+                    *count += 1;
+                }
+            }
         }
 
         true
     }
 }
 
-type CheckFn = Arc<dyn Fn(&Context) -> bool + Send + Sync>;
+type CheckFn = Arc<dyn Fn(Context) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
 
+#[derive(Clone)]
 struct CommandEntry {
     handler: Handler,
     description: Option<String>,
@@ -83,6 +199,9 @@ struct CommandEntry {
     platform: Option<String>,
     cooldown: Arc<CooldownState>,
     checks: Vec<CheckFn>,
+    check_fail_handler: Option<Handler>,
+    rate_limit_handler: Option<Handler>,
+    is_alias: bool,
 }
 
 #[derive(Clone)]
@@ -94,6 +213,7 @@ pub struct HelpEntry {
 
 pub struct Command<F, Fut> {
     name: String,
+    aliases: Vec<String>,
     handler: F,
     description: Option<String>,
     category: Option<String>,
@@ -101,7 +221,12 @@ pub struct Command<F, Fut> {
     platform: Option<String>,
     cooldown: Option<Duration>,
     user_cooldown: Option<Duration>,
+    global_rate: Option<(u32, Duration)>,
+    user_rate: Option<(u32, Duration)>,
+    rate_limit_strategy: RateLimitStrategy,
     checks: Vec<CheckFn>,
+    check_fail_handler: Option<Handler>,
+    rate_limit_handler: Option<Handler>,
     _phantom: PhantomData<Fut>,
 }
 
@@ -113,6 +238,7 @@ where
     pub fn new(name: impl Into<String>, handler: F) -> Self {
         Self {
             name: name.into(),
+            aliases: Vec::new(),
             handler,
             description: None,
             category: None,
@@ -120,9 +246,19 @@ where
             platform: None,
             cooldown: None,
             user_cooldown: None,
+            global_rate: None,
+            user_rate: None,
+            rate_limit_strategy: RateLimitStrategy::FixedWindow,
             checks: Vec::new(),
+            check_fail_handler: None,
+            rate_limit_handler: None,
             _phantom: PhantomData,
         }
+    }
+
+    pub fn alias(mut self, name: impl Into<String>) -> Self {
+        self.aliases.push(name.into());
+        self
     }
 
     pub fn description(mut self, desc: impl Into<String>) -> Self {
@@ -155,8 +291,45 @@ where
         self
     }
 
-    pub fn check(mut self, f: impl Fn(&Context) -> bool + Send + Sync + 'static) -> Self {
-        self.checks.push(Arc::new(f));
+    pub fn rate_limit(mut self, max: u32, window: Duration) -> Self {
+        self.global_rate = Some((max, window));
+        self
+    }
+
+    pub fn user_rate_limit(mut self, max: u32, window: Duration) -> Self {
+        self.user_rate = Some((max, window));
+        self
+    }
+
+    pub fn rate_limit_strategy(mut self, strategy: RateLimitStrategy) -> Self {
+        self.rate_limit_strategy = strategy;
+        self
+    }
+
+    pub fn check<Fc, Fuc>(mut self, f: Fc) -> Self
+    where
+        Fc: Fn(Context) -> Fuc + Send + Sync + 'static,
+        Fuc: Future<Output = bool> + Send + 'static,
+    {
+        self.checks.push(Arc::new(move |ctx| Box::pin(f(ctx))));
+        self
+    }
+
+    pub fn on_check_fail<Fc, Fuc>(mut self, f: Fc) -> Self
+    where
+        Fc: Fn(Context) -> Fuc + Send + Sync + 'static,
+        Fuc: Future<Output = Result<(), TweezerError>> + Send + 'static,
+    {
+        self.check_fail_handler = Some(Arc::new(move |ctx| Box::pin(f(ctx))));
+        self
+    }
+
+    pub fn on_rate_limit<Fc, Fuc>(mut self, f: Fc) -> Self
+    where
+        Fc: Fn(Context) -> Fuc + Send + Sync + 'static,
+        Fuc: Future<Output = Result<(), TweezerError>> + Send + 'static,
+    {
+        self.rate_limit_handler = Some(Arc::new(move |ctx| Box::pin(f(ctx))));
         self
     }
 }
@@ -258,6 +431,24 @@ impl Clone for ShutdownHandle {
         Self {
             tx: self.tx.clone(),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IntoCommand
+// ---------------------------------------------------------------------------
+
+pub trait IntoCommand {
+    fn add_to(self, bot: &mut Bot);
+}
+
+impl<F, Fut> IntoCommand for Command<F, Fut>
+where
+    F: Fn(Context) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<(), TweezerError>> + Send + 'static,
+{
+    fn add_to(self, bot: &mut Bot) {
+        bot.register_command(self);
     }
 }
 
@@ -376,7 +567,11 @@ impl Bot {
         self.lifecycle_handler = Some(Arc::new(move |kind, platform| Box::pin(handler(kind, platform))));
     }
 
-    pub fn add_command<F, Fut>(&mut self, cmd: Command<F, Fut>)
+    pub fn add_command(&mut self, cmd: impl IntoCommand) {
+        cmd.add_to(self);
+    }
+
+    fn register_command<F, Fut>(&mut self, cmd: Command<F, Fut>)
     where
         F: Fn(Context) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), TweezerError>> + Send + 'static,
@@ -386,17 +581,40 @@ impl Bot {
             description: cmd.description,
             category: cmd.category,
             platform: cmd.platform.clone(),
-            cooldown: Arc::new(CooldownState::new(cmd.cooldown, cmd.user_cooldown)),
+            cooldown: Arc::new(CooldownState::new(cmd.cooldown, cmd.user_cooldown, cmd.global_rate, cmd.user_rate, cmd.rate_limit_strategy)),
             checks: cmd.checks,
+            check_fail_handler: cmd.check_fail_handler,
+            rate_limit_handler: cmd.rate_limit_handler,
+            is_alias: false,
         };
+        let aliases = cmd.aliases;
         match (cmd.channel, cmd.platform) {
-            (Some(ch), _) => {
+            (Some(_), Some(_)) => panic!(
+                "command '{}': cannot scope by both channel and platform",
+                cmd.name
+            ),
+            (Some(ch), None) => {
+                for alias in aliases {
+                    let mut e = entry.clone();
+                    e.is_alias = true;
+                    self.channel_commands.insert((ch.clone(), alias), e);
+                }
                 self.channel_commands.insert((ch, cmd.name), entry);
             }
             (None, Some(p)) => {
+                for alias in aliases {
+                    let mut e = entry.clone();
+                    e.is_alias = true;
+                    self.platform_commands.insert((p.clone(), alias), e);
+                }
                 self.platform_commands.insert((p, cmd.name), entry);
             }
             (None, None) => {
+                for alias in aliases {
+                    let mut e = entry.clone();
+                    e.is_alias = true;
+                    self.commands.insert(alias, e);
+                }
                 self.commands.insert(cmd.name, entry);
             }
         }
@@ -407,10 +625,16 @@ impl Bot {
     /// **Must be called after all other commands have been registered.** The
     /// help listing is snapshotted at registration time, so any commands added
     /// after this call will not appear in the output.
+    ///
+    /// Usage:
+    /// - `!help` — lists categories with command counts
+    /// - `!help <category>` — lists commands in a category
+    /// - `!help <command>` — shows description for a specific command
     pub fn help_command(&mut self) {
         let global: Vec<(String, Option<String>, Option<String>)> = self
             .commands
             .iter()
+            .filter(|(_, e)| !e.is_alias)
             .map(|(name, entry)| {
                 (
                     name.clone(),
@@ -422,6 +646,7 @@ impl Bot {
         let per_channel: Vec<(String, String, Option<String>, Option<String>)> = self
             .channel_commands
             .iter()
+            .filter(|(_, e)| !e.is_alias)
             .map(|((ch, name), entry)| {
                 (
                     ch.clone(),
@@ -434,6 +659,7 @@ impl Bot {
         let per_platform: Vec<(String, String, Option<String>, Option<String>)> = self
             .platform_commands
             .iter()
+            .filter(|(_, e)| !e.is_alias)
             .map(|((p, name), entry)| {
                 (
                     p.clone(),
@@ -477,38 +703,82 @@ impl Bot {
 
                 available.sort_by(|a, b| a.0.cmp(&b.0));
 
-                let mut groups: HashMap<
-                    Option<String>,
-                    Vec<&(String, Option<String>, Option<String>)>,
-                > = HashMap::new();
-                for item in &available {
-                    groups.entry(item.2.clone()).or_default().push(item);
+                let query = ctx.args().first().map(|s| s.as_str());
+
+                // Build lookup structures
+                let mut by_name: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
+                let mut by_category: HashMap<Option<String>, Vec<(String, Option<String>)>> = HashMap::new();
+                for (name, desc, cat) in &available {
+                    by_name.insert(name.clone(), (desc.clone(), cat.clone()));
+                    by_category.entry(cat.clone()).or_default().push((name.clone(), desc.clone()));
                 }
 
-                let mut categories: Vec<Option<String>> = groups.keys().cloned().collect();
-                categories.sort_by(|a, b| match (a, b) {
+                // -----------------------------------------------------------------
+                // !help <command>
+                // -----------------------------------------------------------------
+                if let Some(q) = query {
+                    let q_lower = q.to_lowercase();
+                    if let Some((desc, _cat)) = by_name.get(&q_lower) {
+                        let text = match desc {
+                            Some(d) => format!("{}{q_lower}: {d}", prefix),
+                            None => format!("{}{q_lower}", prefix),
+                        };
+                        return ctx.reply(&text).await;
+                    }
+                }
+
+                // -----------------------------------------------------------------
+                // !help <category>
+                // -----------------------------------------------------------------
+                if let Some(q) = query {
+                    let q_lower = q.to_lowercase();
+                    let target_cat = if q_lower == "uncategorized" {
+                        None
+                    } else {
+                        Some(q_lower.clone())
+                    };
+
+                    if let Some(items) = by_category.get(&target_cat) {
+                        let cmd_strs: Vec<String> = items
+                            .iter()
+                            .map(|(name, desc)| match desc {
+                                Some(d) => format!("{}{name} ({d})", prefix),
+                                None => format!("{}{name}", prefix),
+                            })
+                            .collect();
+                        let header = match target_cat {
+                            Some(c) => format!("{c}: "),
+                            None => "uncategorized: ".to_string(),
+                        };
+                        return ctx.reply(&format!("{}{}", header, cmd_strs.join(", "))).await;
+                    }
+                }
+
+                // -----------------------------------------------------------------
+                // !help (category index)
+                // -----------------------------------------------------------------
+                let mut categories: Vec<(Option<String>, usize)> = by_category
+                    .iter()
+                    .map(|(cat, items)| (cat.clone(), items.len()))
+                    .collect();
+                categories.sort_by(|a, b| match (&a.0, &b.0) {
                     (None, _) => std::cmp::Ordering::Less,
                     (_, None) => std::cmp::Ordering::Greater,
                     (Some(a), Some(b)) => a.cmp(b),
                 });
 
-                let mut parts: Vec<String> = Vec::new();
-                for cat in &categories {
-                    let items = groups.get(cat).unwrap();
-                    let cmd_strs: Vec<String> = items
-                        .iter()
-                        .map(|(name, desc, _)| match desc {
-                            Some(d) => format!("{}{name}: {d}", prefix),
-                            None => format!("{}{name}", prefix),
-                        })
-                        .collect();
-                    match cat {
-                        Some(c) => parts.push(format!("{c}: {}", cmd_strs.join(", "))),
-                        None => parts.push(cmd_strs.join(", ")),
-                    }
-                }
+                let cat_strs: Vec<String> = categories
+                    .into_iter()
+                    .map(|(cat, count)| match cat {
+                        Some(c) => format!("{c} ({count})"),
+                        None => format!("uncategorized ({count})"),
+                    })
+                    .collect();
 
-                ctx.reply(&parts.join(" | ")).await
+                ctx.reply(&format!(
+                    "categories: {} — {prefix}help <category> or {prefix}help <command>",
+                    cat_strs.join(", ")
+                )).await
             }
         }));
     }
@@ -524,6 +794,7 @@ impl Bot {
         let global: Vec<HelpEntry> = self
             .commands
             .iter()
+            .filter(|(_, e)| !e.is_alias)
             .map(|(name, entry)| HelpEntry {
                 name: name.clone(),
                 description: entry.description.clone(),
@@ -533,6 +804,7 @@ impl Bot {
         let per_channel: Vec<(String, HelpEntry)> = self
             .channel_commands
             .iter()
+            .filter(|(_, e)| !e.is_alias)
             .map(|((ch, name), entry)| {
                 (
                     ch.clone(),
@@ -547,6 +819,7 @@ impl Bot {
         let per_platform: Vec<(String, HelpEntry)> = self
             .platform_commands
             .iter()
+            .filter(|(_, e)| !e.is_alias)
             .map(|((p, name), entry)| {
                 (
                     p.clone(),
@@ -831,7 +1104,9 @@ impl Bot {
                     msg.emote_fn,
                     state.clone(),
                     msg.max_reply_graphemes,
-                );
+                )
+                .with_message_id(msg.message_id)
+                .with_delete(msg.delete_fn);
 
                 for handler in raw_message_handlers.iter() {
                     let handler = handler.clone();
@@ -876,85 +1151,85 @@ impl Bot {
                             commands.get(&cmd)
                         });
                     if let Some(entry) = entry {
-                        if !entry.checks.iter().all(|c| c(&ctx)) {
-                            if let Some(unrecognized_hook) = unrecognized_command_hook {
-                                let unrecognized_hook = unrecognized_hook.clone();
-                                let ctx = ctx.with_args(args);
-                                let hook = error_hook.clone();
-                                let sem = semaphore.clone();
-                                let cmd_name = cmd.clone();
-                                join_set.spawn(async move {
+                        let checks = entry.checks.clone();
+                        let cooldown = entry.cooldown.clone();
+                        let handler = entry.handler.clone();
+                        let check_fail = entry.check_fail_handler.clone();
+                        let rate_limit = entry.rate_limit_handler.clone();
+                        let ctx = ctx.with_args(args);
+                        let hook = error_hook.clone();
+                        let before_hook = before_command_hook.clone();
+                        let after_hook = after_command_hook.clone();
+                        let unrecognized_hook = unrecognized_command_hook.clone();
+                        let sem = semaphore.clone();
+                        join_set.spawn(async move {
+                            for check in checks.iter() {
+                                if !check(ctx.clone()).await {
+                                    if let Some(fail_handler) = check_fail {
+                                        let _permit = sem.acquire().await.unwrap();
+                                        let platform = ctx.platform().to_string();
+                                        let channel = ctx.channel().to_string();
+                                        if let Err(e) = fail_handler(ctx).await {
+                                            hook(HandlerError {
+                                                kind: HandlerErrorKind::Command { name: cmd.clone() },
+                                                platform,
+                                                channel,
+                                                error: e,
+                                            });
+                                        }
+                                    } else if let Some(unrecognized) = unrecognized_hook {
+                                        let _permit = sem.acquire().await.unwrap();
+                                        let platform = ctx.platform().to_string();
+                                        let channel = ctx.channel().to_string();
+                                        if let Err(e) = unrecognized(ctx, cmd).await {
+                                            hook(HandlerError {
+                                                kind: HandlerErrorKind::UnrecognizedCommand,
+                                                platform,
+                                                channel,
+                                                error: e,
+                                            });
+                                        }
+                                    }
+                                    return;
+                                }
+                            }
+                            if !cooldown.check_and_mark(&ctx.user.id) {
+                                if let Some(rl_handler) = rate_limit {
                                     let _permit = sem.acquire().await.unwrap();
                                     let platform = ctx.platform().to_string();
                                     let channel = ctx.channel().to_string();
-                                    if let Err(e) = unrecognized_hook(ctx, cmd_name).await {
+                                    if let Err(e) = rl_handler(ctx).await {
                                         hook(HandlerError {
-                                            kind: HandlerErrorKind::UnrecognizedCommand,
+                                            kind: HandlerErrorKind::Command { name: cmd },
                                             platform,
                                             channel,
                                             error: e,
                                         });
                                     }
-                                });
+                                }
+                                return;
                             }
-                            return;
-                        }
-                        if !entry.cooldown.check_and_mark(&ctx.user.id) {
-                            return;
-                        }
-                        let handler = entry.handler.clone();
-                        let ctx = ctx.with_args(args);
-
-                        if let Some(before_hook) = before_command_hook {
-                            let before_hook = before_hook.clone();
-                            let before_ctx = ctx.clone();
-                            let before_cmd = cmd.clone();
-                            let handler = handler.clone();
-                            let hook = error_hook.clone();
-                            let after_hook = after_command_hook.clone();
-                            let sem = semaphore.clone();
+                            let _permit = sem.acquire().await.unwrap();
                             let platform = ctx.platform().to_string();
                             let channel = ctx.channel().to_string();
-                            join_set.spawn(async move {
-                                let _permit = sem.acquire().await.unwrap();
-                                if !before_hook(before_ctx, before_cmd).await {
+                            if let Some(before) = before_hook {
+                                if !before(ctx.clone(), cmd.clone()).await {
                                     return;
                                 }
-                                let result = handler(ctx.clone()).await;
-                                if let Some(after) = after_hook {
-                                    after(ctx.clone(), cmd.clone(), result.clone()).await;
-                                }
-                                if let Err(e) = result {
-                                    hook(HandlerError {
-                                        kind: HandlerErrorKind::Command { name: cmd },
-                                        platform,
-                                        channel,
-                                        error: e,
-                                    });
-                                }
-                            });
-                        } else {
-                            let hook = error_hook.clone();
-                            let after_hook = after_command_hook.clone();
-                            let sem = semaphore.clone();
-                            join_set.spawn(async move {
-                                let _permit = sem.acquire().await.unwrap();
-                                let platform = ctx.platform().to_string();
-                                let channel = ctx.channel().to_string();
-                                let result = handler(ctx.clone()).await;
-                                if let Some(after) = after_hook {
-                                    after(ctx, cmd.clone(), result.clone()).await;
-                                }
-                                if let Err(e) = result {
-                                    hook(HandlerError {
-                                        kind: HandlerErrorKind::Command { name: cmd },
-                                        platform,
-                                        channel,
-                                        error: e,
-                                    });
-                                }
-                            });
-                        }
+                            }
+                            let result = handler(ctx.clone()).await;
+                            if let Some(after) = after_hook {
+                                after(ctx, cmd.clone(), result.clone()).await;
+                            }
+                            if let Err(e) = result {
+                                hook(HandlerError {
+                                    kind: HandlerErrorKind::Command { name: cmd },
+                                    platform,
+                                    channel,
+                                    error: e,
+                                });
+                            }
+                        });
                     } else if let Some(unrecognized_hook) = unrecognized_command_hook {
                         let unrecognized_hook = unrecognized_hook.clone();
                         let ctx = ctx.with_args(args);
@@ -1061,6 +1336,8 @@ mod tests {
             reply_tx,
             emote_fn: Arc::new(|name| format!(":{}:", name)),
             max_reply_graphemes: None,
+            message_id: None,
+            delete_fn: None,
         })
     }
 
@@ -1848,7 +2125,7 @@ mod tests {
                     Ok(())
                 }
             })
-            .check(|_ctx| true),
+            .check(|_ctx| async { true }),
         );
 
         let (reply_tx, _) = mpsc::channel(1);
@@ -1870,7 +2147,7 @@ mod tests {
                     Ok(())
                 }
             })
-            .check(|_ctx| false),
+            .check(|_ctx| async { false }),
         );
 
         let (reply_tx, _) = mpsc::channel(1);
@@ -1892,8 +2169,8 @@ mod tests {
                     Ok(())
                 }
             })
-            .check(|_ctx| true)
-            .check(|_ctx| false),
+            .check(|_ctx| async { true })
+            .check(|_ctx| async { false }),
         );
 
         let (reply_tx, _) = mpsc::channel(1);
@@ -1909,7 +2186,7 @@ mod tests {
         let mut bot = Bot::new();
         bot.add_command(
             Command::new("admin", |_ctx| async { Ok(()) })
-                .check(|_ctx| false),
+                .check(|_ctx| async { false }),
         );
         bot.on_unrecognized_command(move |_ctx, cmd| {
             let gc = gc.clone();
@@ -1938,7 +2215,7 @@ mod tests {
                     Ok(())
                 }
             })
-            .check(|ctx| ctx.user().name == "alice"),
+            .check(|ctx| async move { ctx.user().name == "alice" }),
         );
 
         let (reply_tx, _) = mpsc::channel(1);
@@ -1960,7 +2237,7 @@ mod tests {
                     Ok(())
                 }
             })
-            .check(|ctx| ctx.user().name == "bob"),
+            .check(|ctx| async move { ctx.user().name == "bob" }),
         );
 
         let (reply_tx, _) = mpsc::channel(1);
@@ -2317,6 +2594,8 @@ mod tests {
             reply_tx,
             emote_fn: Arc::new(|name| format!(":{}:", name)),
             max_reply_graphemes: None,
+            message_id: None,
+            delete_fn: None,
         });
         run_with_events(bot, vec![event]).await;
         assert!(*fired.lock().unwrap());
@@ -2392,7 +2671,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn help_command_lists_global_commands() {
+    async fn help_command_shows_category_index() {
         let mut bot = Bot::new();
         bot.add_command(
             Command::new("ping", |_ctx| async { Ok(()) }).description("responds with pong"),
@@ -2404,13 +2683,58 @@ mod tests {
         run_with_events(bot, vec![make_message("!help", reply_tx)]).await;
 
         let msg = reply_rx.try_recv().expect("expected a reply");
-        assert!(msg.text.contains("!echo: repeats text"));
-        assert!(msg.text.contains("!ping: responds with pong"));
-        assert!(!msg.text.contains("!help"));
+        assert!(msg.text.contains("categories:"));
+        assert!(msg.text.contains("uncategorized (2)"));
+        assert!(msg.text.contains("!help <category>"));
     }
 
     #[tokio::test]
-    async fn help_command_includes_channel_commands() {
+    async fn help_command_specific_command() {
+        let mut bot = Bot::new();
+        bot.add_command(
+            Command::new("ping", |_ctx| async { Ok(()) }).description("responds with pong"),
+        );
+        bot.help_command();
+
+        let (reply_tx, mut reply_rx) = mpsc::channel(4);
+        run_with_events(bot, vec![make_message("!help ping", reply_tx)]).await;
+
+        let msg = reply_rx.try_recv().expect("expected a reply");
+        assert!(msg.text.contains("!ping: responds with pong"));
+    }
+
+    #[tokio::test]
+    async fn help_command_category_filter() {
+        let mut bot = Bot::new();
+        bot.add_command(
+            Command::new("ping", |_ctx| async { Ok(()) })
+                .description("pong")
+                .category("general"),
+        );
+        bot.add_command(
+            Command::new("echo", |_ctx| async { Ok(()) })
+                .description("repeats")
+                .category("general"),
+        );
+        bot.add_command(
+            Command::new("roll", |_ctx| async { Ok(()) })
+                .description("roll dice")
+                .category("games"),
+        );
+        bot.help_command();
+
+        let (reply_tx, mut reply_rx) = mpsc::channel(4);
+        run_with_events(bot, vec![make_message("!help general", reply_tx)]).await;
+
+        let msg = reply_rx.try_recv().expect("expected a reply");
+        assert!(msg.text.contains("general:"));
+        assert!(msg.text.contains("!ping (pong)"));
+        assert!(msg.text.contains("!echo (repeats)"));
+        assert!(!msg.text.contains("!roll"));
+    }
+
+    #[tokio::test]
+    async fn help_command_includes_channel_commands_in_index() {
         let mut bot = Bot::new();
         bot.add_command(
             Command::new("ping", |_ctx| async { Ok(()) }).description("responds with pong"),
@@ -2426,8 +2750,7 @@ mod tests {
         run_with_events(bot, vec![make_message_in("!help", "ch-a", reply_tx)]).await;
 
         let msg = reply_rx.try_recv().expect("expected a reply");
-        assert!(msg.text.contains("!ping: responds with pong"));
-        assert!(msg.text.contains("!timer: what is the timer?"));
+        assert!(msg.text.contains("uncategorized (2)"));
     }
 
     #[tokio::test]
@@ -2449,8 +2772,24 @@ mod tests {
         run_with_events(bot, vec![make_message_in("!help", "ch-a", reply_tx)]).await;
 
         let msg = reply_rx.try_recv().expect("expected a reply");
-        assert!(msg.text.contains("!timer: timer for a"));
-        assert!(!msg.text.contains("timer for b"));
+        assert!(msg.text.contains("uncategorized (1)"));
+    }
+
+    #[tokio::test]
+    async fn help_command_channel_specific_lookup() {
+        let mut bot = Bot::new();
+        bot.add_command(
+            Command::new("timer", |_ctx| async { Ok(()) })
+                .description("timer for a")
+                .channel("ch-a"),
+        );
+        bot.help_command();
+
+        let (reply_tx, mut reply_rx) = mpsc::channel(4);
+        run_with_events(bot, vec![make_message_in("!help timer", "ch-a", reply_tx)]).await;
+
+        let msg = reply_rx.try_recv().expect("expected a reply");
+        assert!(msg.text.contains("timer for a"));
     }
 
     #[tokio::test]
@@ -2460,7 +2799,7 @@ mod tests {
         bot.help_command();
 
         let (reply_tx, mut reply_rx) = mpsc::channel(4);
-        run_with_events(bot, vec![make_message_in("/help", "general", reply_tx)]).await;
+        run_with_events(bot, vec![make_message_in("/help ping", "general", reply_tx)]).await;
 
         let msg = reply_rx.try_recv().expect("expected a reply");
         assert!(msg.text.contains("/ping: pong"));
@@ -2548,6 +2887,8 @@ mod tests {
             reply_tx,
             emote_fn: Arc::new(|name| format!(":{}:", name)),
             max_reply_graphemes: None,
+            message_id: None,
+            delete_fn: None,
         })
     }
 
@@ -2706,5 +3047,600 @@ mod tests {
         .await;
         assert!(*channel_fired.lock().unwrap());
         assert!(!*platform_fired.lock().unwrap());
+    }
+
+    // -----------------------------------------------------------------------
+    // Alias tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn alias_dispatches_to_same_handler() {
+        let fired = Arc::new(Mutex::new(0u32));
+        let fired_clone = fired.clone();
+
+        let mut bot = Bot::new();
+        bot.add_command(
+            Command::new("ping", move |_ctx| {
+                let fired = fired_clone.clone();
+                async move {
+                    *fired.lock().unwrap() += 1;
+                    Ok(())
+                }
+            })
+            .alias("p"),
+        );
+
+        let (tx1, _) = mpsc::channel(1);
+        let (tx2, _) = mpsc::channel(1);
+        run_with_events(
+            bot,
+            vec![make_message("!ping", tx1), make_message("!p", tx2)],
+        )
+        .await;
+        assert_eq!(*fired.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn multiple_aliases_all_dispatch() {
+        let fired = Arc::new(Mutex::new(0u32));
+        let fired_clone = fired.clone();
+
+        let mut bot = Bot::new();
+        bot.add_command(
+            Command::new("ping", move |_ctx| {
+                let fired = fired_clone.clone();
+                async move {
+                    *fired.lock().unwrap() += 1;
+                    Ok(())
+                }
+            })
+            .alias("p")
+            .alias("pong"),
+        );
+
+        let (tx1, _) = mpsc::channel(1);
+        let (tx2, _) = mpsc::channel(1);
+        let (tx3, _) = mpsc::channel(1);
+        run_with_events(
+            bot,
+            vec![
+                make_message("!ping", tx1),
+                make_message("!p", tx2),
+                make_message("!pong", tx3),
+            ],
+        )
+        .await;
+        assert_eq!(*fired.lock().unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn alias_shares_cooldown_with_primary() {
+        let fired = Arc::new(Mutex::new(0u32));
+        let fired_clone = fired.clone();
+
+        let mut bot = Bot::new();
+        bot.add_command(
+            Command::new("ping", move |_ctx| {
+                let fired = fired_clone.clone();
+                async move {
+                    *fired.lock().unwrap() += 1;
+                    Ok(())
+                }
+            })
+            .alias("p")
+            .user_cooldown(Duration::from_secs(60)),
+        );
+
+        let (tx1, _) = mpsc::channel(1);
+        let (tx2, _) = mpsc::channel(1);
+        // Same user invokes !ping then !p — second should be suppressed by cooldown
+        run_with_events(
+            bot,
+            vec![make_message("!ping", tx1), make_message("!p", tx2)],
+        )
+        .await;
+        assert_eq!(*fired.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn alias_does_not_appear_in_help() {
+        let mut bot = Bot::new();
+        bot.add_command(
+            Command::new("ping", |ctx| async move { ctx.reply("pong").await })
+                .description("pings the bot")
+                .alias("p"),
+        );
+        bot.help_command();
+
+        // Index should show count, not alias
+        let (reply_tx, mut reply_rx) = mpsc::channel(4);
+        run_with_events(bot, vec![make_message("!help", reply_tx)]).await;
+
+        let msg = reply_rx.try_recv().expect("expected help reply");
+        assert!(
+            !msg.text.contains(" p") && !msg.text.contains("!p "),
+            "alias should not appear in help index: {}",
+            msg.text
+        );
+    }
+
+    #[tokio::test]
+    async fn help_command_resolves_primary_name_not_alias() {
+        let mut bot = Bot::new();
+        bot.add_command(
+            Command::new("ping", |ctx| async move { ctx.reply("pong").await })
+                .description("pings the bot")
+                .alias("p"),
+        );
+        bot.help_command();
+
+        let (reply_tx, mut reply_rx) = mpsc::channel(4);
+        run_with_events(bot, vec![make_message("!help ping", reply_tx)]).await;
+
+        let msg = reply_rx.try_recv().expect("expected help reply");
+        assert!(msg.text.contains("pings the bot"), "primary name should resolve: {}", msg.text);
+    }
+
+    #[tokio::test]
+    async fn alias_on_channel_scoped_command_dispatches() {
+        let fired = Arc::new(Mutex::new(false));
+        let fired_clone = fired.clone();
+
+        let mut bot = Bot::new();
+        bot.add_command(
+            Command::new("ping", move |_ctx| {
+                let fired = fired_clone.clone();
+                async move {
+                    *fired.lock().unwrap() = true;
+                    Ok(())
+                }
+            })
+            .channel("streamer-a")
+            .alias("p"),
+        );
+
+        let (reply_tx, _) = mpsc::channel(1);
+        run_with_events(bot, vec![make_message_in("!p", "streamer-a", reply_tx)]).await;
+        assert!(*fired.lock().unwrap());
+    }
+
+    // -----------------------------------------------------------------------
+    // Rate limit tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn global_rate_limit_blocks_excess_requests_fixed_window() {
+        let fired = Arc::new(Mutex::new(0u32));
+        let f = fired.clone();
+
+        let mut bot = Bot::new();
+        bot.add_command(
+            Command::new("ping", move |_ctx| {
+                let f = f.clone();
+                async move {
+                    *f.lock().unwrap() += 1;
+                    Ok(())
+                }
+            })
+            .rate_limit(2, Duration::from_secs(60)),
+        );
+
+        let (tx1, _) = mpsc::channel(1);
+        let (tx2, _) = mpsc::channel(1);
+        let (tx3, _) = mpsc::channel(1);
+        run_with_events(
+            bot,
+            vec![
+                make_message("!ping", tx1),
+                make_message("!ping", tx2),
+                make_message("!ping", tx3),
+            ],
+        )
+        .await;
+        assert_eq!(*fired.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn user_rate_limit_blocks_excess_requests_fixed_window() {
+        let fired = Arc::new(Mutex::new(0u32));
+        let f = fired.clone();
+
+        let mut bot = Bot::new();
+        bot.add_command(
+            Command::new("ping", move |_ctx| {
+                let f = f.clone();
+                async move {
+                    *f.lock().unwrap() += 1;
+                    Ok(())
+                }
+            })
+            .user_rate_limit(1, Duration::from_secs(60)),
+        );
+
+        let (tx1, _) = mpsc::channel(1);
+        let (tx2, _) = mpsc::channel(1);
+        run_with_events(
+            bot,
+            vec![make_message("!ping", tx1), make_message("!ping", tx2)],
+        )
+        .await;
+        assert_eq!(*fired.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn global_rate_limit_blocks_excess_requests_leaky_bucket() {
+        let fired = Arc::new(Mutex::new(0u32));
+        let f = fired.clone();
+
+        let mut bot = Bot::new();
+        bot.add_command(
+            Command::new("ping", move |_ctx| {
+                let f = f.clone();
+                async move {
+                    *f.lock().unwrap() += 1;
+                    Ok(())
+                }
+            })
+            .rate_limit(2, Duration::from_secs(60))
+            .rate_limit_strategy(RateLimitStrategy::LeakyBucket),
+        );
+
+        let (tx1, _) = mpsc::channel(1);
+        let (tx2, _) = mpsc::channel(1);
+        let (tx3, _) = mpsc::channel(1);
+        run_with_events(
+            bot,
+            vec![
+                make_message("!ping", tx1),
+                make_message("!ping", tx2),
+                make_message("!ping", tx3),
+            ],
+        )
+        .await;
+        assert_eq!(*fired.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn user_rate_limit_blocks_excess_requests_leaky_bucket() {
+        let fired = Arc::new(Mutex::new(0u32));
+        let f = fired.clone();
+
+        let mut bot = Bot::new();
+        bot.add_command(
+            Command::new("ping", move |_ctx| {
+                let f = f.clone();
+                async move {
+                    *f.lock().unwrap() += 1;
+                    Ok(())
+                }
+            })
+            .user_rate_limit(1, Duration::from_secs(60))
+            .rate_limit_strategy(RateLimitStrategy::LeakyBucket),
+        );
+
+        let (tx1, _) = mpsc::channel(1);
+        let (tx2, _) = mpsc::channel(1);
+        run_with_events(
+            bot,
+            vec![make_message("!ping", tx1), make_message("!ping", tx2)],
+        )
+        .await;
+        assert_eq!(*fired.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_combined_with_cooldown() {
+        let fired = Arc::new(Mutex::new(0u32));
+        let f = fired.clone();
+
+        let mut bot = Bot::new();
+        bot.add_command(
+            Command::new("ping", move |_ctx| {
+                let f = f.clone();
+                async move {
+                    *f.lock().unwrap() += 1;
+                    Ok(())
+                }
+            })
+            .cooldown(Duration::from_secs(60))
+            .rate_limit(1, Duration::from_secs(60)),
+        );
+
+        let (tx1, _) = mpsc::channel(1);
+        let (tx2, _) = mpsc::channel(1);
+        run_with_events(
+            bot,
+            vec![make_message("!ping", tx1), make_message("!ping", tx2)],
+        )
+        .await;
+        assert_eq!(*fired.lock().unwrap(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // CooldownState direct tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn fixed_window_allows_up_to_max() {
+        let state = CooldownState::new(
+            None,
+            None,
+            Some((2, Duration::from_secs(60))),
+            None,
+            RateLimitStrategy::FixedWindow,
+        );
+        assert!(state.check_and_mark("user1"));
+        assert!(state.check_and_mark("user1"));
+        assert!(!state.check_and_mark("user1"));
+    }
+
+    #[test]
+    fn fixed_window_resets_after_window() {
+        let state = CooldownState::new(
+            None,
+            None,
+            Some((1, Duration::from_millis(50))),
+            None,
+            RateLimitStrategy::FixedWindow,
+        );
+        assert!(state.check_and_mark("user1"));
+        assert!(!state.check_and_mark("user1"));
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(state.check_and_mark("user1"));
+    }
+
+    #[test]
+    fn user_fixed_window_tracks_per_user() {
+        let state = CooldownState::new(
+            None,
+            None,
+            None,
+            Some((1, Duration::from_secs(60))),
+            RateLimitStrategy::FixedWindow,
+        );
+        assert!(state.check_and_mark("alice"));
+        assert!(!state.check_and_mark("alice"));
+        assert!(state.check_and_mark("bob"));
+    }
+
+    #[test]
+    fn leaky_bucket_allows_burst_up_to_max() {
+        let state = CooldownState::new(
+            None,
+            None,
+            Some((2, Duration::from_secs(60))),
+            None,
+            RateLimitStrategy::LeakyBucket,
+        );
+        assert!(state.check_and_mark("user1"));
+        assert!(state.check_and_mark("user1"));
+        assert!(!state.check_and_mark("user1"));
+    }
+
+    #[test]
+    fn leaky_bucket_refills_over_time() {
+        let state = CooldownState::new(
+            None,
+            None,
+            Some((2, Duration::from_millis(200))),
+            None,
+            RateLimitStrategy::LeakyBucket,
+        );
+        assert!(state.check_and_mark("user1"));
+        assert!(state.check_and_mark("user1"));
+        assert!(!state.check_and_mark("user1"));
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(state.check_and_mark("user1"));
+        assert!(!state.check_and_mark("user1"));
+    }
+
+    #[test]
+    fn user_leaky_bucket_tracks_per_user() {
+        let state = CooldownState::new(
+            None,
+            None,
+            None,
+            Some((1, Duration::from_secs(60))),
+            RateLimitStrategy::LeakyBucket,
+        );
+        assert!(state.check_and_mark("alice"));
+        assert!(!state.check_and_mark("alice"));
+        assert!(state.check_and_mark("bob"));
+    }
+
+    #[test]
+    fn cooldown_blocks_repeated_calls() {
+        let state = CooldownState::new(
+            Some(Duration::from_secs(60)),
+            None,
+            None,
+            None,
+            RateLimitStrategy::FixedWindow,
+        );
+        assert!(state.check_and_mark("user1"));
+        assert!(!state.check_and_mark("user1"));
+        assert!(!state.check_and_mark("user2"));
+    }
+
+    #[test]
+    fn user_cooldown_blocks_same_user_only() {
+        let state = CooldownState::new(
+            None,
+            Some(Duration::from_secs(60)),
+            None,
+            None,
+            RateLimitStrategy::FixedWindow,
+        );
+        assert!(state.check_and_mark("alice"));
+        assert!(!state.check_and_mark("alice"));
+        assert!(state.check_and_mark("bob"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Feedback hook tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn on_check_fail_fires_when_check_fails() {
+        let got = Arc::new(Mutex::new(false));
+        let g = got.clone();
+
+        let mut bot = Bot::new();
+        bot.add_command(
+            Command::new("admin", |_ctx| async { Ok(()) })
+                .check(|_ctx| async { false })
+                .on_check_fail(move |ctx| {
+                    let g = g.clone();
+                    async move {
+                        *g.lock().unwrap() = true;
+                        ctx.reply("nope").await
+                    }
+                }),
+        );
+
+        let (reply_tx, mut reply_rx) = mpsc::channel(4);
+        run_with_events(bot, vec![make_message("!admin", reply_tx)]).await;
+        assert!(*got.lock().unwrap());
+        let msg = reply_rx.try_recv().expect("expected reply");
+        assert_eq!(msg.text, "nope");
+    }
+
+    #[tokio::test]
+    async fn on_check_fail_does_not_fire_when_check_passes() {
+        let fired = Arc::new(Mutex::new(false));
+        let f = fired.clone();
+
+        let mut bot = Bot::new();
+        bot.add_command(
+            Command::new("admin", move |_ctx| {
+                let f = f.clone();
+                async move {
+                    *f.lock().unwrap() = true;
+                    Ok(())
+                }
+            })
+            .check(|_ctx| async { true })
+            .on_check_fail(|ctx| async move { ctx.reply("nope").await }),
+        );
+
+        let (reply_tx, _) = mpsc::channel(4);
+        run_with_events(bot, vec![make_message("!admin", reply_tx)]).await;
+        assert!(*fired.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn on_rate_limit_fires_when_rate_limited() {
+        let got = Arc::new(Mutex::new(false));
+        let g = got.clone();
+
+        let mut bot = Bot::new();
+        bot.add_command(
+            Command::new("ping", |_ctx| async { Ok(()) })
+                .rate_limit(1, Duration::from_secs(60))
+                .on_rate_limit(move |ctx| {
+                    let g = g.clone();
+                    async move {
+                        *g.lock().unwrap() = true;
+                        ctx.reply("slow down").await
+                    }
+                }),
+        );
+
+        let (tx1, _) = mpsc::channel(1);
+        let (tx2, mut reply_rx) = mpsc::channel(4);
+        run_with_events(bot, vec![make_message("!ping", tx1), make_message("!ping", tx2)]).await;
+        assert!(*got.lock().unwrap());
+        let msg = reply_rx.try_recv().expect("expected reply");
+        assert_eq!(msg.text, "slow down");
+    }
+
+    #[tokio::test]
+    async fn on_rate_limit_does_not_fire_when_under_limit() {
+        let fired = Arc::new(Mutex::new(false));
+        let f = fired.clone();
+
+        let mut bot = Bot::new();
+        bot.add_command(
+            Command::new("ping", move |_ctx| {
+                let f = f.clone();
+                async move {
+                    *f.lock().unwrap() = true;
+                    Ok(())
+                }
+            })
+            .rate_limit(2, Duration::from_secs(60))
+            .on_rate_limit(|ctx| async move { ctx.reply("slow down").await }),
+        );
+
+        let (reply_tx, _) = mpsc::channel(1);
+        run_with_events(bot, vec![make_message("!ping", reply_tx)]).await;
+        assert!(*fired.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn check_fail_and_rate_limit_both_independent() {
+        let check_fired = Arc::new(Mutex::new(false));
+        let rate_fired = Arc::new(Mutex::new(false));
+        let cf = check_fired.clone();
+        let rf = rate_fired.clone();
+
+        let mut bot = Bot::new();
+        bot.add_command(
+            Command::new("cmd", |_ctx| async { Ok(()) })
+                .check(|_ctx| async { false })
+                .on_check_fail(move |ctx| {
+                    let cf = cf.clone();
+                    async move {
+                        *cf.lock().unwrap() = true;
+                        ctx.reply("check failed").await
+                    }
+                })
+                .on_rate_limit(move |ctx| {
+                    let rf = rf.clone();
+                    async move {
+                        *rf.lock().unwrap() = true;
+                        ctx.reply("rate limited").await
+                    }
+                }),
+        );
+
+        let (reply_tx, mut reply_rx) = mpsc::channel(4);
+        run_with_events(bot, vec![make_message("!cmd", reply_tx)]).await;
+        assert!(*check_fired.lock().unwrap());
+        assert!(!*rate_fired.lock().unwrap());
+        let msg = reply_rx.try_recv().expect("expected reply");
+        assert_eq!(msg.text, "check failed");
+    }
+
+    #[tokio::test]
+    async fn check_fail_called_before_rate_limit() {
+        let order = Arc::new(Mutex::new(Vec::<String>::new()));
+        let o1 = order.clone();
+        let o2 = order.clone();
+
+        let mut bot = Bot::new();
+        bot.add_command(
+            Command::new("cmd", |_ctx| async { Ok(()) })
+                .check(|_ctx| async { false })
+                .on_check_fail(move |ctx| {
+                    let o = o1.clone();
+                    async move {
+                        o.lock().unwrap().push("check_fail".into());
+                        ctx.reply("check").await
+                    }
+                })
+                .on_rate_limit(move |ctx| {
+                    let o = o2.clone();
+                    async move {
+                        o.lock().unwrap().push("rate_limit".into());
+                        ctx.reply("rate").await
+                    }
+                }),
+        );
+
+        let (reply_tx, _) = mpsc::channel(4);
+        run_with_events(bot, vec![make_message("!cmd", reply_tx)]).await;
+        let got = order.lock().unwrap().clone();
+        assert_eq!(got, vec!["check_fail"]);
     }
 }

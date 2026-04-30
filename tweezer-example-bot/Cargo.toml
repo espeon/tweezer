@@ -9,14 +9,19 @@ path = "src/main.rs"
 
 [dependencies]
 async-trait = "0.1"
+axum = "0.8"
 dotenvy = "0.15"
 regex = "1"
+rand = "0.8"
 reqwest = { version = "0.12", features = ["json"] }
+rusqlite = { version = "0.34", features = ["bundled"] }
+urlencoding = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tlx-client = { git = "https://github.com/espeon/tlx" }
 tweezer = { path = "../tweezer" }
 tweezer-streamplace = { path = "../tweezer-streamplace" }
 

@@ -1,4 +1,5 @@
 mod adapter;
+mod args;
 mod bot;
 mod context;
 mod error;
@@ -10,11 +11,13 @@ mod typemap;
 mod user;
 
 pub mod test {
-    pub use crate::test_util::TestContextBuilder;
+    pub use crate::test_util::{TestContextBuilder, TestTriggerContextBuilder};
 }
 
 pub use adapter::{Adapter, BotTx};
-pub use bot::{Bot, Command, HandlerError, HandlerErrorKind, HelpEntry, ShutdownHandle};
+pub use args::{FromArgs, ParseArgsError};
+pub use bot::{Bot, Command, HandlerError, HandlerErrorKind, HelpEntry, IntoCommand, RateLimitStrategy, ShutdownHandle};
+pub use tweezer_macros::command;
 pub use context::Context;
 pub use error::TweezerError;
 pub use event::{Event, IncomingMessage, LifecycleEvent, LifecycleKind};
@@ -27,7 +30,9 @@ pub use user::User;
 
 pub mod prelude {
     pub use crate::{
-        Adapter, Bot, BotTx, Context, PlatformTrigger, TriggerContext, TriggerKind, TweezerError,
+        Adapter, Bot, BotTx, Command, Context, FromArgs, HelpEntry, IntoCommand, ParseArgsError,
+        PlatformTrigger, RateLimitStrategy, TriggerContext, TriggerKind, TweezerError,
     };
     pub use async_trait::async_trait;
+    pub use tweezer_macros::command;
 }

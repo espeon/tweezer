@@ -44,6 +44,13 @@ struct CreateRecordInput {
 }
 
 #[derive(Serialize)]
+struct DeleteRecordInput {
+    repo: String,
+    collection: String,
+    rkey: String,
+}
+
+#[derive(Serialize)]
 struct ChatMessageRecord {
     #[serde(rename = "$type")]
     type_: String,
@@ -395,6 +402,31 @@ impl XrpcClient {
             let body = resp.text().await.unwrap_or_default();
             error!(%status, %body, "failed to send message");
             return Err(format!("createRecord failed ({status}): {body}"));
+        }
+
+        Ok(())
+    }
+
+    pub async fn delete_chat_message(&self, rkey: &str) -> Result<(), String> {
+        let url = format!("{}/xrpc/com.atproto.repo.deleteRecord", self.service);
+
+        let resp = self.client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.access_jwt))
+            .json(&DeleteRecordInput {
+                repo: self.did.clone(),
+                collection: "place.stream.chat.message".to_string(),
+                rkey: rkey.to_string(),
+            })
+            .send()
+            .await
+            .map_err(|e| format!("deleteRecord request failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            error!(%status, %body, "failed to delete message");
+            return Err(format!("deleteRecord failed ({status}): {body}"));
         }
 
         Ok(())
