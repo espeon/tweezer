@@ -529,6 +529,66 @@ impl XrpcClient {
         Ok(())
     }
 
+    pub async fn delete_gate(&self, streamer: &str, gate_uri: &str) -> Result<(), String> {
+        let url = format!("{}/xrpc/place.stream.moderation.deleteGate", self.service);
+        let resp = self.client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.access_jwt))
+            .json(&serde_json::json!({
+                "streamer": streamer,
+                "hiddenMessage": gate_uri,
+            }))
+            .send()
+            .await
+            .map_err(|e| format!("deleteGate request failed: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("deleteGate failed ({status}): {body}"));
+        }
+        Ok(())
+    }
+
+    pub async fn delete_block(&self, streamer: &str, block_uri: &str) -> Result<(), String> {
+        let url = format!("{}/xrpc/place.stream.moderation.deleteBlock", self.service);
+        let resp = self.client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.access_jwt))
+            .json(&serde_json::json!({
+                "streamer": streamer,
+                "subject": block_uri,
+            }))
+            .send()
+            .await
+            .map_err(|e| format!("deleteBlock request failed: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("deleteBlock failed ({status}): {body}"));
+        }
+        Ok(())
+    }
+
+    pub async fn delete_pin(&self, streamer: &str, pin_uri: &str) -> Result<(), String> {
+        let url = format!("{}/xrpc/place.stream.moderation.deletePin", self.service);
+        let resp = self.client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.access_jwt))
+            .json(&serde_json::json!({
+                "streamer": streamer,
+                "pinnedMessage": pin_uri,
+            }))
+            .send()
+            .await
+            .map_err(|e| format!("deletePin request failed: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("deletePin failed ({status}): {body}"));
+        }
+        Ok(())
+    }
+
     pub async fn update_chat_profile(
         &self,
         color: Option<&serde_json::Value>,

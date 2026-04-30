@@ -779,8 +779,18 @@ async fn handle_chat_message(did: String, rkey: String, record: RawData<'static>
                             .await
                             .map_err(|e| tweezer::TweezerError::Handler(e))
                     }
+                    ModerationAction::UnhideMessage { gate_uri } => {
+                        xrpc.delete_gate(&streamer, &gate_uri)
+                            .await
+                            .map_err(|e| tweezer::TweezerError::Handler(e))
+                    }
                     ModerationAction::BanUser { user_did } => {
                         xrpc.create_block(&streamer, &user_did)
+                            .await
+                            .map_err(|e| tweezer::TweezerError::Handler(e))
+                    }
+                    ModerationAction::UnbanUser { block_uri } => {
+                        xrpc.delete_block(&streamer, &block_uri)
                             .await
                             .map_err(|e| tweezer::TweezerError::Handler(e))
                     }
@@ -789,7 +799,11 @@ async fn handle_chat_message(did: String, rkey: String, record: RawData<'static>
                             .await
                             .map_err(|e| tweezer::TweezerError::Handler(e))
                     }
-                    _ => Ok(()),
+                    ModerationAction::UnpinMessage { pin_uri } => {
+                        xrpc.delete_pin(&streamer, &pin_uri)
+                            .await
+                            .map_err(|e| tweezer::TweezerError::Handler(e))
+                    }
                 }
             }
         }),
@@ -1294,7 +1308,9 @@ async fn build_outgoing_facets(text: &str, shared: &SharedState) -> Option<Vec<O
                 byte_end,
             } => {
                 let url = text[byte_start..byte_end].to_string();
-                facets.push(OutgoingFacet::link(byte_start, byte_end, url));
+                if is_safe_url(&url) {
+                    facets.push(OutgoingFacet::link(byte_start, byte_end, url));
+                }
             }
             ScannedFacet::BareLink {
                 byte_start,
@@ -1359,6 +1375,16 @@ async fn build_outgoing_facets(text: &str, shared: &SharedState) -> Option<Vec<O
     } else {
         Some(facets)
     }
+}
+
+fn is_safe_url(url: &str) -> bool {
+    if let Some(colon) = url.find(':') {
+        let scheme = &url[..colon].to_lowercase();
+        if scheme == "javascript" || scheme == "data" || scheme == "vbscript" {
+            return false;
+        }
+    }
+    true
 }
 
 fn replace_byte_range(s: &str, start: usize, end: usize, replacement: &str) -> Option<String> {
@@ -1759,5 +1785,54 @@ mod tests {
         }
         assert!(is_moderator(&shared, "did:plc:streamer", "did:plc:mod"));
         assert!(!is_moderator(&shared, "did:plc:streamer", "did:plc:viewer"));
+    }
+
+    #[test]
+    fn is_safe_url_allows_https() {
+        assert!(is_safe_url("https://example.com"));
+    }
+
+    #[test]
+    fn is_safe_url_rejects_javascript() {
+        assert!(!is_safe_url("javascript:alert(1)"));
+        assert!(!is_safe_url("JAVASCRIPT:alert(1)"));
+    }
+
+    #[test]
+    fn is_safe_url_rejects_data_and_vbscript() {
+        assert!(!is_safe_url("data:text/html,<script>alert(1)</script>"));
+        assert!(!is_safe_url("vbscript:msgbox(1)"));
+    }
+
+    #[tokio::test]
+    async fn build_outgoing_facets_skips_unsafe_url() {
+        let shared = SharedState {
+            bot_tx: mpsc::channel(1).0,
+            streamers: HashSet::new(),
+            xrpc: Arc::new(XrpcClient::test_new(
+                "https://example.com".into(),
+                "x".into(),
+                "y".into(),
+                "did:plc:bot".into(),
+            )),
+            user_cache: UserCache::new(),
+            emote_fn: Arc::new(|name| format!(":{}:", name)),
+            chat_profiles: RwLock::new(HashMap::new()),
+            streamer_states: RwLock::new(HashMap::new()),
+            emote_items: RwLock::new(HashMap::new()),
+            badge_defs: RwLock::new(HashMap::new()),
+            badge_issuances: RwLock::new(HashMap::new()),
+            emote_packs: RwLock::new(HashMap::new()),
+            emote_delegations: RwLock::new(HashMap::new()),
+            bot_follows: RwLock::new(HashSet::new()),
+            block_rkey_to_subject: RwLock::new(HashMap::new()),
+            mod_rkey_to_moderator: RwLock::new(HashMap::new()),
+        };
+        let facets = build_outgoing_facets("see https://example.com and javascript:alert(1)", &shared).await;
+        assert!(facets.is_some());
+        let facets = facets.unwrap();
+        assert_eq!(facets.len(), 1);
+        let json = serde_json::to_string(&facets[0]).unwrap();
+        assert!(json.contains("https://example.com"));
     }
 }
