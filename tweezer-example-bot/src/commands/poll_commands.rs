@@ -3,7 +3,6 @@ use std::time::Duration;
 use tweezer::{Bot, Command, Context, RateLimitStrategy};
 
 use crate::commands::polls::PollManager;
-use crate::Moderators;
 
 // ---------------------------------------------------------------------------
 // Commands
@@ -49,7 +48,11 @@ pub fn add_commands(bot: &mut Bot) {
             }
         })
         .description("start a poll (e.g. !poll \"best color?\" red blue green)")
-        .category("general")
+        .category("moderation")
+        .check(|ctx| async move { ctx.is_streamer() || ctx.is_moderator() })
+        .on_check_fail(|ctx| async move {
+            ctx.reply("only the streamer or mods can start polls").await
+        })
         .rate_limit(3, Duration::from_secs(300))
         .user_rate_limit(1, Duration::from_secs(300))
         .rate_limit_strategy(RateLimitStrategy::FixedWindow)
@@ -77,7 +80,8 @@ pub fn add_commands(bot: &mut Bot) {
             let channel = ctx.channel().to_string();
             let user_id = ctx.user().id.clone();
             match mgr.vote(&channel, &user_id, choice) {
-                Ok(()) => ctx.reply("vote counted").await,
+                Ok(true) => ctx.reply("vote counted").await,
+                Ok(false) => ctx.reply("vote changed").await,
                 Err(e) => ctx.reply(&format!("couldn't vote: {e}")).await,
             }
         })
@@ -106,13 +110,9 @@ pub fn add_commands(bot: &mut Bot) {
         })
         .description("end the active poll and show results (mod only)")
         .category("moderation")
-        .check(|ctx| async move {
-            ctx.state::<Moderators>()
-                .map(|m| m.contains(ctx.user().name.as_str()))
-                .unwrap_or(false)
-        })
+        .check(|ctx| async move { ctx.is_streamer() || ctx.is_moderator() })
         .on_check_fail(|ctx| async move {
-            ctx.reply("only the streamer can end polls").await
+            ctx.reply("only the streamer or mods can end polls").await
         }),
     );
 }

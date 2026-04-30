@@ -31,16 +31,17 @@ impl ActivePoll {
         self.options.iter().map(|o| o.voters.len()).sum()
     }
 
-    pub fn vote(&mut self, user_id: &str, choice: usize) -> Result<(), &'static str> {
+    pub fn vote(&mut self, user_id: &str, choice: usize) -> Result<bool, &'static str> {
         if choice == 0 || choice > self.options.len() {
             return Err("invalid option");
         }
+        let had_vote = self.options.iter().any(|o| o.voters.contains(user_id));
         // Remove user from all options first (one vote per user)
         for opt in &mut self.options {
             opt.voters.remove(user_id);
         }
         self.options[choice - 1].voters.insert(user_id.to_string());
-        Ok(())
+        Ok(!had_vote)
     }
 
     pub fn format_results(&self) -> String {
@@ -107,7 +108,8 @@ impl PollManager {
         self.polls.lock().unwrap().get(channel).cloned()
     }
 
-    pub fn vote(&self, channel: &str, user_id: &str, choice: usize) -> Result<(), &'static str> {
+    /// Returns `true` if this was the user's first vote, `false` if they changed their vote.
+    pub fn vote(&self, channel: &str, user_id: &str, choice: usize) -> Result<bool, &'static str> {
         let mut polls = self.polls.lock().unwrap();
         let poll = polls.get_mut(channel).ok_or("no active poll")?;
         poll.vote(user_id, choice)
@@ -122,9 +124,9 @@ mod tests {
     fn vote_and_results() {
         let mgr = PollManager::new();
         mgr.start("ch1", "best color?", vec!["red".into(), "blue".into()]).unwrap();
-        mgr.vote("ch1", "alice", 1).unwrap();
-        mgr.vote("ch1", "bob", 2).unwrap();
-        mgr.vote("ch1", "alice", 2).unwrap(); // change vote
+        assert!(mgr.vote("ch1", "alice", 1).unwrap());     // new vote
+        assert!(mgr.vote("ch1", "bob", 2).unwrap());       // new vote
+        assert!(!mgr.vote("ch1", "alice", 2).unwrap());    // changed vote
 
         let poll = mgr.get("ch1").unwrap();
         let results = poll.results();
