@@ -176,7 +176,14 @@ fn is_domain_byte(b: u8) -> bool {
 struct ChatProfile {
     color: Option<tweezer::ChatColor>,
     labels: Vec<String>,
-    badges: Vec<tweezer::BadgeInfo>,
+    selected_badges: Vec<BadgeSelection>,
+}
+
+#[derive(Clone)]
+struct BadgeSelection {
+    streamer_did: Option<String>,
+    badge_uri: String,
+    badge_cid: String,
 }
 
 /// Per-streamer state indexed from the firehose.
@@ -187,11 +194,39 @@ struct StreamerState {
 }
 
 #[derive(Clone)]
+struct BadgeDef {
+    name: String,
+    description: String,
+    badge_type: String,
+    image_cid: String,
+}
+
+#[derive(Clone)]
+struct BadgeIssuance {
+    recipient_did: String,
+    badge_def_uri: String,
+}
+
+#[derive(Clone)]
 struct EmoteItem {
     name: String,
     pack_uri: String,
     image_cid: String,
     alt: String,
+}
+
+#[derive(Clone)]
+struct EmotePack {
+    name: String,
+    open_in_my_chat: bool,
+    owner_did: String,
+}
+
+#[derive(Clone)]
+struct EmotePackDelegation {
+    recipient_did: String,
+    pack_uri: String,
+    allowed_emotes: Vec<String>,
 }
 
 struct SharedState {
@@ -203,6 +238,13 @@ struct SharedState {
     chat_profiles: RwLock<HashMap<String, ChatProfile>>,
     streamer_states: RwLock<HashMap<String, StreamerState>>,
     emote_items: RwLock<HashMap<String, EmoteItem>>,
+    badge_defs: RwLock<HashMap<String, BadgeDef>>,
+    badge_issuances: RwLock<HashMap<String, Vec<BadgeIssuance>>>,
+    emote_packs: RwLock<HashMap<String, EmotePack>>,
+    emote_delegations: RwLock<HashMap<String, Vec<EmotePackDelegation>>>,
+    bot_follows: RwLock<HashSet<String>>,
+    block_rkey_to_subject: RwLock<HashMap<String, String>>,
+    mod_rkey_to_moderator: RwLock<HashMap<String, String>>,
 }
 
 pub struct StreamplaceAdapter {
@@ -279,6 +321,13 @@ impl Adapter for StreamplaceAdapter {
             chat_profiles: RwLock::new(HashMap::new()),
             streamer_states: RwLock::new(HashMap::new()),
             emote_items: RwLock::new(HashMap::new()),
+            badge_defs: RwLock::new(HashMap::new()),
+            badge_issuances: RwLock::new(HashMap::new()),
+            emote_packs: RwLock::new(HashMap::new()),
+            emote_delegations: RwLock::new(HashMap::new()),
+            bot_follows: RwLock::new(HashSet::new()),
+            block_rkey_to_subject: RwLock::new(HashMap::new()),
+            mod_rkey_to_moderator: RwLock::new(HashMap::new()),
         });
 
         info!(
@@ -379,7 +428,7 @@ async fn handle_message(msg: RawJetstreamMessage<'static>, shared: &Arc<SharedSt
             GATE_COLLECTION => handle_gate(did_str, record, shared).await,
             PIN_COLLECTION => handle_pin(did_str, record, shared).await,
             BLOCK_COLLECTION => handle_block(did_str, rkey, record, shared).await,
-            MOD_PERMISSION_COLLECTION => handle_mod_permission(did_str, record, shared).await,
+            MOD_PERMISSION_COLLECTION => handle_mod_permission(did_str, rkey, record, shared).await,
             BADGE_DEF_COLLECTION => handle_badge_def(rkey, record, shared).await,
             BADGE_ISSUANCE_COLLECTION => handle_badge_issuance(did_str, record, shared).await,
             EMOTE_PACK_COLLECTION => handle_emote_pack(did_str, rkey, record, shared).await,
@@ -390,6 +439,7 @@ async fn handle_message(msg: RawJetstreamMessage<'static>, shared: &Arc<SharedSt
         CommitOperation::Delete => match collection.as_str() {
             BLOCK_COLLECTION => handle_block_delete(did_str, rkey, shared).await,
             MOD_PERMISSION_COLLECTION => handle_mod_permission_delete(did_str, rkey, shared).await,
+            FOLLOW_COLLECTION => handle_follow_delete(did_str, rkey, shared).await,
             _ => {}
         },
         CommitOperation::Update => {}
@@ -415,6 +465,12 @@ fn parse_raw_color(obj: &BTreeMap<SmolStr, RawData<'_>>) -> Option<tweezer::Chat
     Some(tweezer::ChatColor { red, green, blue })
 }
 
+fn parse_badge_ref(obj: &BTreeMap<SmolStr, RawData<'_>>) -> Option<(String, String)> {
+    let uri = obj.get("uri")?.as_str()?.to_string();
+    let cid = obj.get("cid")?.as_str()?.to_string();
+    Some((uri, cid))
+}
+
 fn parse_chat_profile(record: &RawData<'_>) -> Option<ChatProfile> {
     let obj = record.as_object()?;
     let color = obj.get("color").and_then(|c| c.as_object()).and_then(parse_raw_color);
@@ -427,10 +483,36 @@ fn parse_chat_profile(record: &RawData<'_>) -> Option<ChatProfile> {
                 .collect()
         })
         .unwrap_or_default();
+
+    let mut selected_badges = Vec::new();
+    if let Some(badges) = obj.get("badges").and_then(|v| v.as_object()) {
+        if let Some(streamer_badges) = badges.get("streamer").and_then(|v| v.as_array()) {
+            for item in streamer_badges {
+                let item_obj = item.as_object()?;
+                let streamer_did = item_obj.get("streamer")?.as_str()?;
+                let (uri, cid) = item_obj.get("badge")?.as_object().and_then(parse_badge_ref)?;
+                selected_badges.push(BadgeSelection {
+                    streamer_did: Some(streamer_did.to_string()),
+                    badge_uri: uri,
+                    badge_cid: cid,
+                });
+            }
+        }
+        if let Some(global_badge) = badges.get("global").and_then(|v| v.as_object()) {
+            if let Some((uri, cid)) = parse_badge_ref(global_badge) {
+                selected_badges.push(BadgeSelection {
+                    streamer_did: None,
+                    badge_uri: uri,
+                    badge_cid: cid,
+                });
+            }
+        }
+    }
+
     Some(ChatProfile {
         color,
         labels,
-        badges: Vec::new(),
+        selected_badges,
     })
 }
 
@@ -451,14 +533,77 @@ fn parse_reply_ref(record: &RawData<'_>) -> Option<ReplyRef> {
     })
 }
 
-fn hydrate_user(did: &str, display_name: Option<String>, shared: &SharedState) -> User {
-    let (color, labels, badges) = shared
+fn hydrate_user(
+    did: &str,
+    display_name: Option<String>,
+    streamer: Option<&str>,
+    shared: &SharedState,
+) -> User {
+    let profile = shared
         .chat_profiles
         .read()
         .ok()
-        .and_then(|profiles| profiles.get(did).cloned())
-        .map(|p| (p.color, p.labels, p.badges))
-        .unwrap_or_default();
+        .and_then(|profiles| profiles.get(did).cloned());
+
+    let color = profile.as_ref().and_then(|p| p.color.clone());
+    let labels = profile.as_ref().map(|p| p.labels.clone()).unwrap_or_default();
+    let selected_badges = profile.map(|p| p.selected_badges).unwrap_or_default();
+
+    let mut badges: Vec<tweezer::BadgeInfo> = Vec::new();
+
+    // Server-controlled badges.
+    if let Some(streamer) = streamer {
+        if did == streamer {
+            badges.push(tweezer::BadgeInfo {
+                name: "Streamer".into(),
+                kind: tweezer::BadgeKind::Streamer,
+            });
+        }
+        if is_moderator(shared, streamer, did) {
+            badges.push(tweezer::BadgeInfo {
+                name: "Mod".into(),
+                kind: tweezer::BadgeKind::Moderator,
+            });
+        }
+    }
+    if labels.iter().any(|l| l.eq_ignore_ascii_case("bot")) {
+        badges.push(tweezer::BadgeInfo {
+            name: "Bot".into(),
+            kind: tweezer::BadgeKind::Bot,
+        });
+    }
+
+    // Resolve selected badges against index.
+    let badge_defs = shared.badge_defs.read().ok();
+    let badge_issuances = shared.badge_issuances.read().ok();
+    for selection in selected_badges {
+        // Skip streamer-specific badges that don't match the current streamer.
+        if let Some(ref badge_streamer) = selection.streamer_did {
+            if streamer != Some(badge_streamer.as_str()) {
+                continue;
+            }
+        }
+        // Verify the user has an issuance for this badge.
+        let has_issuance = badge_issuances
+            .as_ref()
+            .and_then(|map| map.get(did))
+            .map(|list| list.iter().any(|i| i.badge_def_uri == selection.badge_uri))
+            .unwrap_or(false);
+        if !has_issuance {
+            continue;
+        }
+        if let Some(def) = badge_defs.as_ref().and_then(|map| map.get(&selection.badge_uri)) {
+            let kind = match def.badge_type.as_str() {
+                "place.stream.badge.defs#vip" | "vip" => tweezer::BadgeKind::Vip,
+                _ => tweezer::BadgeKind::Event,
+            };
+            badges.push(tweezer::BadgeInfo {
+                name: def.name.clone(),
+                kind,
+            });
+        }
+    }
+
     User {
         name: did.to_string(),
         id: did.to_string(),
@@ -603,7 +748,7 @@ async fn handle_chat_message(did: String, rkey: String, record: RawData<'static>
     let event = tweezer::Event::Message(
         IncomingMessage::new(
             "streamplace",
-            hydrate_user(&did, display_name, shared),
+            hydrate_user(&did, display_name, Some(&streamer), shared),
             text,
             streamer,
             reply_tx,
@@ -657,6 +802,14 @@ async fn handle_follow(did: String, record: RawData<'static>, shared: &Arc<Share
         Some(s) => s.to_string(),
         None => return,
     };
+
+    // Track follows by the bot for emote pack access.
+    if did == shared.xrpc.did() {
+        if let Ok(mut follows) = shared.bot_follows.write() {
+            follows.insert(subject.clone());
+        }
+    }
+
     if !shared.streamers.contains(&subject) {
         return;
     }
@@ -682,14 +835,22 @@ async fn handle_follow(did: String, record: RawData<'static>, shared: &Arc<Share
 
     let event = tweezer::Event::Trigger(TriggerEvent::new(
         "streamplace",
-        subject,
+        subject.clone(),
         TriggerKind::Follow {
-            user: hydrate_user(&did, display_name, shared),
+            user: hydrate_user(&did, display_name, Some(&subject), shared),
         },
         reply_tx,
         Arc::new(|name| format!(":{}:", name)),
     ));
     shared.bot_tx.send(event).await.ok();
+}
+
+async fn handle_follow_delete(did: String, _rkey: String, shared: &Arc<SharedState>) {
+    if did == shared.xrpc.did() {
+        // We don't know the subject from the delete tombstone alone,
+        // so we can't selectively remove a follow. In practice, the bot
+        // rarely unfollows, and a reconnect will rebuild state.
+    }
 }
 
 async fn handle_teleport(did: String, record: RawData<'static>, shared: &Arc<SharedState>) {
@@ -790,9 +951,17 @@ async fn handle_pin(did: String, record: RawData<'static>, shared: &Arc<SharedSt
     shared.bot_tx.send(event).await.ok();
 }
 
+fn extract_blob_cid(obj: &BTreeMap<SmolStr, RawData<'_>>) -> Option<String> {
+    obj.get("ref")
+        .and_then(|r| r.as_object())
+        .and_then(|r| r.get("$link").or_else(|| r.get("$cid")))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
 async fn handle_block(
     did: String,
-    _rkey: String,
+    rkey: String,
     record: RawData<'static>,
     shared: &Arc<SharedState>,
 ) {
@@ -811,12 +980,15 @@ async fn handle_block(
             .blocked_dids
             .insert(subject.clone());
     }
+    if let Ok(mut map) = shared.block_rkey_to_subject.write() {
+        map.insert(format!("{streamer}/{rkey}"), subject.clone());
+    }
     let display_name = shared.user_cache.resolve_handle(&subject).await;
     let event = tweezer::Event::Trigger(TriggerEvent::new(
         "streamplace",
         streamer.clone(),
         TriggerKind::UserBanned {
-            user: hydrate_user(&subject, display_name, shared),
+            user: hydrate_user(&subject, display_name, Some(&streamer), shared),
             banned_by: streamer.clone(),
         },
         mpsc::channel(1).0,
@@ -825,19 +997,30 @@ async fn handle_block(
     shared.bot_tx.send(event).await.ok();
 }
 
-async fn handle_block_delete(did: String, _rkey: String, shared: &Arc<SharedState>) {
+async fn handle_block_delete(did: String, rkey: String, shared: &Arc<SharedState>) {
     let streamer = did.clone();
     if !shared.streamers.contains(&streamer) {
         return;
     }
-    // We don't know the subject from the delete tombstone alone,
-    // so we emit an unbanned trigger without the user DID.
+    let key = format!("{streamer}/{rkey}");
+    let subject = {
+        let mut map = match shared.block_rkey_to_subject.write() {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        map.remove(&key)
+    };
+    let user_did = subject.clone().unwrap_or_default();
+    let _display_name = match &subject {
+        Some(s) => shared.user_cache.resolve_handle(s).await,
+        None => None,
+    };
     let event = tweezer::Event::Trigger(TriggerEvent::new(
         "streamplace",
         streamer.clone(),
         TriggerKind::UserUnbanned {
-            user_did: String::new(),
-            unbanned_by: streamer,
+            user_did,
+            unbanned_by: streamer.clone(),
         },
         mpsc::channel(1).0,
         shared.emote_fn.clone(),
@@ -845,7 +1028,12 @@ async fn handle_block_delete(did: String, _rkey: String, shared: &Arc<SharedStat
     shared.bot_tx.send(event).await.ok();
 }
 
-async fn handle_mod_permission(did: String, record: RawData<'static>, shared: &Arc<SharedState>) {
+async fn handle_mod_permission(
+    did: String,
+    rkey: String,
+    record: RawData<'static>,
+    shared: &Arc<SharedState>,
+) {
     let moderator = match raw_str(&record, "moderator") {
         Some(s) => s.to_string(),
         None => return,
@@ -856,50 +1044,124 @@ async fn handle_mod_permission(did: String, record: RawData<'static>, shared: &A
     }
     if let Ok(mut states) = shared.streamer_states.write() {
         states
-            .entry(streamer)
+            .entry(streamer.clone())
             .or_default()
             .mod_dids
-            .insert(moderator);
+            .insert(moderator.clone());
+    }
+    if let Ok(mut map) = shared.mod_rkey_to_moderator.write() {
+        map.insert(format!("{streamer}/{rkey}"), moderator);
     }
 }
 
 async fn handle_mod_permission_delete(
     did: String,
-    _rkey: String,
+    rkey: String,
     shared: &Arc<SharedState>,
 ) {
     let streamer = did;
     if !shared.streamers.contains(&streamer) {
         return;
     }
-    // Without the full record we can't know which mod was removed,
-    // so we clear all mod permissions and let them be rebuilt from firehose.
-    if let Ok(mut states) = shared.streamer_states.write() {
-        if let Some(state) = states.get_mut(&streamer) {
-            state.mod_dids.clear();
+    let key = format!("{streamer}/{rkey}");
+    let moderator = {
+        let mut map = match shared.mod_rkey_to_moderator.write() {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        map.remove(&key)
+    };
+    if let Some(mod_did) = moderator {
+        if let Ok(mut states) = shared.streamer_states.write() {
+            if let Some(state) = states.get_mut(&streamer) {
+                state.mod_dids.remove(&mod_did);
+            }
         }
     }
 }
 
-async fn handle_badge_def(_rkey: String, _record: RawData<'static>, _shared: &Arc<SharedState>) {
-    // TODO: Index badge definitions for hydration.
+async fn handle_badge_def(rkey: String, record: RawData<'static>, shared: &Arc<SharedState>) {
+    let name = raw_str(&record, "name").unwrap_or("").to_string();
+    let description = raw_str(&record, "description").unwrap_or("").to_string();
+    let badge_type = raw_str(&record, "badgeType").unwrap_or("").to_string();
+    let image_cid = record
+        .as_object()
+        .and_then(|obj| obj.get("image"))
+        .and_then(|img| img.as_object())
+        .and_then(extract_blob_cid)
+        .unwrap_or_default();
+
+    let def = BadgeDef {
+        name,
+        description,
+        badge_type,
+        image_cid,
+    };
+
+    let uri = format!("at://{}/place.stream.badge.def/{rkey}", shared.xrpc.did());
+    if let Ok(mut defs) = shared.badge_defs.write() {
+        defs.insert(uri, def);
+    }
 }
 
 async fn handle_badge_issuance(
-    _did: String,
-    _record: RawData<'static>,
-    _shared: &Arc<SharedState>,
+    did: String,
+    record: RawData<'static>,
+    shared: &Arc<SharedState>,
 ) {
-    // TODO: Index badge issuances for user hydration.
+    let recipient = match raw_str(&record, "did") {
+        Some(s) => s.to_string(),
+        None => return,
+    };
+    let badge_uri = record
+        .as_object()
+        .and_then(|obj| obj.get("badge"))
+        .and_then(|b| b.as_object())
+        .and_then(|b| b.get("uri"))
+        .and_then(|u| u.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+
+    if badge_uri.is_empty() {
+        return;
+    }
+
+    let issuance = BadgeIssuance {
+        recipient_did: recipient.clone(),
+        badge_def_uri: badge_uri,
+    };
+
+    if let Ok(mut issuances) = shared.badge_issuances.write() {
+        issuances
+            .entry(recipient)
+            .or_default()
+            .push(issuance);
+    }
 }
 
 async fn handle_emote_pack(
-    _did: String,
-    _rkey: String,
-    _record: RawData<'static>,
-    _shared: &Arc<SharedState>,
+    did: String,
+    rkey: String,
+    record: RawData<'static>,
+    shared: &Arc<SharedState>,
 ) {
-    // TODO: Index emote packs.
+    let name = raw_str(&record, "name").unwrap_or("").to_string();
+    let open_in_my_chat = record
+        .as_object()
+        .and_then(|obj| obj.get("openInMyChat"))
+        .and_then(|v| v.as_boolean())
+        .unwrap_or(false);
+
+    let pack = EmotePack {
+        name,
+        open_in_my_chat,
+        owner_did: did.clone(),
+    };
+
+    let uri = format!("at://{did}/place.stream.emote.pack/{rkey}");
+    if let Ok(mut packs) = shared.emote_packs.write() {
+        packs.insert(uri, pack);
+    }
 }
 
 async fn handle_emote_item(
@@ -919,11 +1181,7 @@ async fn handle_emote_item(
         .as_object()
         .and_then(|obj| obj.get("image"))
         .and_then(|img| img.as_object())
-        .and_then(|img| img.get("ref"))
-        .and_then(|r#ref| r#ref.as_object())
-        .and_then(|r#ref| r#ref.get("$link"))
-        .and_then(|link| link.as_str())
-        .map(|s| s.to_string())
+        .and_then(extract_blob_cid)
         .unwrap_or_default();
 
     let uri = format!("at://{did}/place.stream.emote.item/{rkey}");
@@ -939,13 +1197,53 @@ async fn handle_emote_item(
 }
 
 async fn handle_emote_delegation(
-    _did: String,
-    _record: RawData<'static>,
-    _shared: &Arc<SharedState>,
+    did: String,
+    record: RawData<'static>,
+    shared: &Arc<SharedState>,
 ) {
-    // TODO: Index emote pack delegations.
-}
+    let recipient = match raw_str(&record, "did") {
+        Some(s) => s.to_string(),
+        None => return,
+    };
+    let pack_uri = record
+        .as_object()
+        .and_then(|obj| obj.get("pack"))
+        .and_then(|p| p.as_object())
+        .and_then(|p| p.get("uri"))
+        .and_then(|u| u.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_default();
 
+    let allowed_emotes = record
+        .as_object()
+        .and_then(|obj| obj.get("emotes"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| {
+                    e.as_object()
+                        .and_then(|o| o.get("uri"))
+                        .and_then(|u| u.as_str())
+                        .map(|s| s.to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if pack_uri.is_empty() {
+        return;
+    }
+
+    let delegation = EmotePackDelegation {
+        recipient_did: recipient.clone(),
+        pack_uri,
+        allowed_emotes,
+    };
+
+    if let Ok(mut delegations) = shared.emote_delegations.write() {
+        delegations.entry(recipient).or_default().push(delegation);
+    }
+}
 fn scan_emote_facets(text: &str) -> Vec<(usize, usize, String)> {
     let bytes = text.as_bytes();
     let len = bytes.len();
@@ -1011,10 +1309,46 @@ async fn build_outgoing_facets(text: &str, shared: &SharedState) -> Option<Vec<O
 
     if !emote_scanned.is_empty() {
         let items = shared.emote_items.read().ok()?;
+        let packs = shared.emote_packs.read().ok()?;
+        let delegations = shared.emote_delegations.read().ok()?;
+        let bot_follows = shared.bot_follows.read().ok()?;
+        let bot_did = shared.xrpc.did();
+
         for (start, end, name) in emote_scanned {
-            // Find an emote item with this name.
-            // TODO: validate access rights (pack delegation, openInMyChat).
-            if let Some((uri, _item)) = items.iter().find(|(_, item)| item.name == name) {
+            let Some((uri, item)) = items.iter().find(|(_, item)| item.name == name) else {
+                continue;
+            };
+
+            let mut allowed = false;
+
+            if let Some(pack) = packs.get(&item.pack_uri) {
+                // Own pack.
+                if pack.owner_did == bot_did {
+                    allowed = true;
+                }
+                // openInMyChat + following the owner.
+                else if pack.open_in_my_chat && bot_follows.contains(&pack.owner_did) {
+                    allowed = true;
+                }
+            }
+
+            // Delegated pack.
+            if !allowed {
+                if let Some(list) = delegations.get(bot_did) {
+                    for delegation in list {
+                        if item.pack_uri == delegation.pack_uri {
+                            if delegation.allowed_emotes.is_empty()
+                                || delegation.allowed_emotes.contains(uri)
+                            {
+                                allowed = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if allowed {
                 facets.push(OutgoingFacet::emote(start, end, uri.clone()));
             }
         }
@@ -1343,8 +1677,15 @@ mod tests {
             chat_profiles: RwLock::new(HashMap::new()),
             streamer_states: RwLock::new(HashMap::new()),
             emote_items: RwLock::new(HashMap::new()),
+            badge_defs: RwLock::new(HashMap::new()),
+            badge_issuances: RwLock::new(HashMap::new()),
+            emote_packs: RwLock::new(HashMap::new()),
+            emote_delegations: RwLock::new(HashMap::new()),
+            bot_follows: RwLock::new(HashSet::new()),
+            block_rkey_to_subject: RwLock::new(HashMap::new()),
+            mod_rkey_to_moderator: RwLock::new(HashMap::new()),
         };
-        let user = hydrate_user("did:plc:test", Some("alice".into()), &shared);
+        let user = hydrate_user("did:plc:test", Some("alice".into()), None, &shared);
         assert_eq!(user.name, "did:plc:test");
         assert_eq!(user.display_name, Some("alice".into()));
         assert!(user.color.is_none());
@@ -1367,6 +1708,13 @@ mod tests {
             chat_profiles: RwLock::new(HashMap::new()),
             streamer_states: RwLock::new(HashMap::new()),
             emote_items: RwLock::new(HashMap::new()),
+            badge_defs: RwLock::new(HashMap::new()),
+            badge_issuances: RwLock::new(HashMap::new()),
+            emote_packs: RwLock::new(HashMap::new()),
+            emote_delegations: RwLock::new(HashMap::new()),
+            bot_follows: RwLock::new(HashSet::new()),
+            block_rkey_to_subject: RwLock::new(HashMap::new()),
+            mod_rkey_to_moderator: RwLock::new(HashMap::new()),
         };
         {
             let mut states = shared.streamer_states.write().unwrap();
@@ -1395,6 +1743,13 @@ mod tests {
             chat_profiles: RwLock::new(HashMap::new()),
             streamer_states: RwLock::new(HashMap::new()),
             emote_items: RwLock::new(HashMap::new()),
+            badge_defs: RwLock::new(HashMap::new()),
+            badge_issuances: RwLock::new(HashMap::new()),
+            emote_packs: RwLock::new(HashMap::new()),
+            emote_delegations: RwLock::new(HashMap::new()),
+            bot_follows: RwLock::new(HashSet::new()),
+            block_rkey_to_subject: RwLock::new(HashMap::new()),
+            mod_rkey_to_moderator: RwLock::new(HashMap::new()),
         };
         {
             let mut states = shared.streamer_states.write().unwrap();
