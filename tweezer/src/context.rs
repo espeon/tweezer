@@ -3,22 +3,11 @@ use std::{future::Future, pin::Pin, sync::Arc};
 use tokio::sync::mpsc::Sender;
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::{typemap::TypeMap, FromArgs, OutgoingMessage, ParseArgsError, ReplyRef, TweezerError, User};
+use crate::{typemap::TypeMap, FromArgs, ModerationAction, OutgoingMessage, ParseArgsError, ReplyRef, TweezerError, User};
 
 type DeleteFn = Arc<
     dyn Fn() -> Pin<Box<dyn Future<Output = Result<(), TweezerError>> + Send>> + Send + Sync,
 >;
-
-/// Platform-agnostic moderation action.
-#[derive(Debug, Clone)]
-pub enum ModerationAction {
-    HideMessage { message_uri: String },
-    UnhideMessage { gate_uri: String },
-    BanUser { user_did: String },
-    UnbanUser { block_uri: String },
-    PinMessage { message_uri: String, expires_at: Option<String> },
-    UnpinMessage { pin_uri: String },
-}
 
 type ModerationFn = Arc<
     dyn Fn(ModerationAction) -> Pin<Box<dyn Future<Output = Result<(), TweezerError>> + Send>>

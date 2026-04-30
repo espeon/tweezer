@@ -18,9 +18,9 @@ pub use adapter::{Adapter, BotTx};
 pub use args::{FromArgs, ParseArgsError};
 pub use bot::{Bot, Command, HandlerError, HandlerErrorKind, HelpEntry, IntoCommand, RateLimitStrategy, ShutdownHandle};
 pub use tweezer_macros::command;
-pub use context::{Context, ModerationAction};
+pub use context::Context;
 pub use error::TweezerError;
-pub use event::{Event, IncomingMessage, LifecycleEvent, LifecycleKind, ReplyRef};
+pub use event::{Event, IncomingMessage, LifecycleEvent, LifecycleKind, ModerationAction, ReplyRef};
 pub use message::OutgoingMessage;
 pub use trigger::{
     PlatformTrigger, TriggerContext, TriggerEvent, TriggerKind,

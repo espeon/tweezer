@@ -112,6 +112,18 @@ impl OutgoingFacet {
             }],
         }
     }
+
+    pub fn emote(byte_start: usize, byte_end: usize, emote_uri: String) -> Self {
+        Self {
+            type_: "place.stream.richtext.facet".to_string(),
+            index: OutgoingByteSlice { byte_start, byte_end },
+            features: vec![OutgoingFacetFeature {
+                type_: "place.stream.richtext.facet#emote".to_string(),
+                did: None,
+                uri: Some(emote_uri),
+            }],
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -429,6 +441,112 @@ impl XrpcClient {
             return Err(format!("deleteRecord failed ({status}): {body}"));
         }
 
+        Ok(())
+    }
+
+    pub async fn create_gate(&self, streamer: &str, message_uri: &str) -> Result<(), String> {
+        let url = format!("{}/xrpc/place.stream.moderation.createGate", self.service);
+        let resp = self.client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.access_jwt))
+            .json(&serde_json::json!({
+                "streamer": streamer,
+                "hiddenMessage": message_uri,
+                "createdAt": chrono_like_iso_now(),
+            }))
+            .send()
+            .await
+            .map_err(|e| format!("createGate request failed: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("createGate failed ({status}): {body}"));
+        }
+        Ok(())
+    }
+
+    pub async fn create_block(&self, streamer: &str, subject: &str) -> Result<(), String> {
+        let url = format!("{}/xrpc/place.stream.moderation.createBlock", self.service);
+        let resp = self.client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.access_jwt))
+            .json(&serde_json::json!({
+                "streamer": streamer,
+                "subject": subject,
+                "createdAt": chrono_like_iso_now(),
+            }))
+            .send()
+            .await
+            .map_err(|e| format!("createBlock request failed: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("createBlock failed ({status}): {body}"));
+        }
+        Ok(())
+    }
+
+    pub async fn create_pin(
+        &self,
+        streamer: &str,
+        message_uri: &str,
+        expires_at: Option<&str>,
+    ) -> Result<(), String> {
+        let url = format!("{}/xrpc/place.stream.moderation.createPin", self.service);
+        let mut body = serde_json::json!({
+            "streamer": streamer,
+            "pinnedMessage": message_uri,
+            "createdAt": chrono_like_iso_now(),
+        });
+        if let Some(exp) = expires_at {
+            body["expiresAt"] = exp.into();
+        }
+        let resp = self.client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.access_jwt))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("createPin request failed: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("createPin failed ({status}): {body}"));
+        }
+        Ok(())
+    }
+
+    pub async fn update_chat_profile(
+        &self,
+        color: Option<&serde_json::Value>,
+        labels: &[String],
+    ) -> Result<(), String> {
+        let url = format!("{}/xrpc/com.atproto.repo.putRecord", self.service);
+        let mut record = serde_json::json!({
+            "$type": "place.stream.chat.profile",
+        });
+        if let Some(c) = color {
+            record["color"] = c.clone();
+        }
+        if !labels.is_empty() {
+            record["selfLabels"] = labels.iter().map(|l| serde_json::json!(l)).collect();
+        }
+        let resp = self.client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.access_jwt))
+            .json(&serde_json::json!({
+                "repo": self.did,
+                "collection": "place.stream.chat.profile",
+                "record": record,
+            }))
+            .send()
+            .await
+            .map_err(|e| format!("putRecord chat profile failed: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("putRecord chat profile failed ({status}): {body}"));
+        }
         Ok(())
     }
 }

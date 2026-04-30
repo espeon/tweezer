@@ -4,6 +4,23 @@ use tokio::sync::mpsc::Sender;
 
 use crate::{OutgoingMessage, TweezerError, User};
 
+/// Platform-agnostic moderation action.
+#[derive(Debug, Clone)]
+pub enum ModerationAction {
+    HideMessage { message_uri: String },
+    UnhideMessage { gate_uri: String },
+    BanUser { user_did: String },
+    UnbanUser { block_uri: String },
+    PinMessage { message_uri: String, expires_at: Option<String> },
+    UnpinMessage { pin_uri: String },
+}
+
+type ModerationFn = Arc<
+    dyn Fn(ModerationAction) -> Pin<Box<dyn Future<Output = Result<(), TweezerError>> + Send>>
+        + Send
+        + Sync,
+>;
+
 pub enum Event {
     Message(IncomingMessage),
     Trigger(crate::trigger::TriggerEvent),
@@ -45,6 +62,7 @@ pub struct IncomingMessage {
     pub(crate) max_reply_graphemes: Option<usize>,
     pub(crate) message_id: Option<String>,
     pub(crate) delete_fn: Option<DeleteFn>,
+    pub(crate) moderation_fn: Option<ModerationFn>,
     pub(crate) reply: Option<ReplyRef>,
     pub(crate) is_streamer: bool,
     pub(crate) is_moderator: bool,
@@ -69,6 +87,7 @@ impl IncomingMessage {
             max_reply_graphemes: None,
             message_id: None,
             delete_fn: None,
+            moderation_fn: None,
             reply: None,
             is_streamer: false,
             is_moderator: false,
@@ -94,8 +113,17 @@ impl IncomingMessage {
         self
     }
 
-    pub fn reply(mut self, reply: ReplyRef) -> Self {
-        self.reply = Some(reply);
+    pub fn on_moderate<F, Fut>(mut self, f: F) -> Self
+    where
+        F: Fn(ModerationAction) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), TweezerError>> + Send + 'static,
+    {
+        self.moderation_fn = Some(Arc::new(move |action| Box::pin(f(action))));
+        self
+    }
+
+    pub fn reply(mut self, reply: Option<ReplyRef>) -> Self {
+        self.reply = reply;
         self
     }
 

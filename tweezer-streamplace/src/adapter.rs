@@ -1,4 +1,9 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    sync::{Arc, RwLock},
+};
+
+use jacquard_common::deps::smol_str::SmolStr;
 
 use async_trait::async_trait;
 use jacquard_common::{
@@ -9,9 +14,10 @@ use jacquard_common::{
 };
 use n0_future::StreamExt;
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tweezer::{
-    Adapter, BotTx, IncomingMessage, OutgoingMessage, TriggerEvent, TriggerKind, TweezerError, User,
+    Adapter, BotTx, IncomingMessage, ModerationAction, OutgoingMessage, ReplyRef, TriggerEvent,
+    TriggerKind, TweezerError, User,
 };
 
 use crate::xrpc::{OutgoingFacet, UserCache, XrpcClient, resolve_pds};
@@ -19,6 +25,16 @@ use crate::xrpc::{OutgoingFacet, UserCache, XrpcClient, resolve_pds};
 const COLLECTION: &str = "place.stream.chat.message";
 const FOLLOW_COLLECTION: &str = "app.bsky.graph.follow";
 const TELEPORT_COLLECTION: &str = "place.stream.live.teleport";
+const CHAT_PROFILE_COLLECTION: &str = "place.stream.chat.profile";
+const GATE_COLLECTION: &str = "place.stream.chat.gate";
+const PIN_COLLECTION: &str = "place.stream.chat.pinnedRecord";
+const BLOCK_COLLECTION: &str = "app.bsky.graph.block";
+const MOD_PERMISSION_COLLECTION: &str = "place.stream.moderation.permission";
+const BADGE_DEF_COLLECTION: &str = "place.stream.badge.def";
+const BADGE_ISSUANCE_COLLECTION: &str = "place.stream.badge.issuance";
+const EMOTE_PACK_COLLECTION: &str = "place.stream.emote.pack";
+const EMOTE_ITEM_COLLECTION: &str = "place.stream.emote.item";
+const EMOTE_DELEGATION_COLLECTION: &str = "place.stream.emote.packDelegation";
 
 struct Facet {
     index: ByteSlice,
@@ -156,12 +172,37 @@ fn is_domain_byte(b: u8) -> bool {
         )
 }
 
+#[derive(Clone, Default)]
+struct ChatProfile {
+    color: Option<tweezer::ChatColor>,
+    labels: Vec<String>,
+    badges: Vec<tweezer::BadgeInfo>,
+}
+
+/// Per-streamer state indexed from the firehose.
+#[derive(Clone, Default)]
+struct StreamerState {
+    blocked_dids: HashSet<String>,
+    mod_dids: HashSet<String>,
+}
+
+#[derive(Clone)]
+struct EmoteItem {
+    name: String,
+    pack_uri: String,
+    image_cid: String,
+    alt: String,
+}
+
 struct SharedState {
     bot_tx: BotTx,
     streamers: HashSet<String>,
     xrpc: Arc<XrpcClient>,
     user_cache: UserCache,
     emote_fn: Arc<dyn Fn(&str) -> String + Send + Sync>,
+    chat_profiles: RwLock<HashMap<String, ChatProfile>>,
+    streamer_states: RwLock<HashMap<String, StreamerState>>,
+    emote_items: RwLock<HashMap<String, EmoteItem>>,
 }
 
 pub struct StreamplaceAdapter {
@@ -235,6 +276,9 @@ impl Adapter for StreamplaceAdapter {
             xrpc: Arc::new(xrpc),
             user_cache: UserCache::new(),
             emote_fn: self.emote_fn(),
+            chat_profiles: RwLock::new(HashMap::new()),
+            streamer_states: RwLock::new(HashMap::new()),
+            emote_items: RwLock::new(HashMap::new()),
         });
 
         info!(
@@ -244,6 +288,17 @@ impl Adapter for StreamplaceAdapter {
             "connected to streamplace"
         );
 
+        // Self-label as bot in chat profile.
+        let xrpc_for_profile = shared.xrpc.clone();
+        tokio::spawn(async move {
+            if let Err(e) = xrpc_for_profile
+                .update_chat_profile(None, &["bot".to_string()])
+                .await
+            {
+                warn!(error = %e, "failed to set chat profile");
+            }
+        });
+
         tokio::spawn(async move {
             let client = TungsteniteSubscriptionClient::from_base_uri(base_uri);
             let params = RawJetstreamParams::new()
@@ -251,6 +306,16 @@ impl Adapter for StreamplaceAdapter {
                     CowStr::from(COLLECTION),
                     CowStr::from(FOLLOW_COLLECTION),
                     CowStr::from(TELEPORT_COLLECTION),
+                    CowStr::from(CHAT_PROFILE_COLLECTION),
+                    CowStr::from(GATE_COLLECTION),
+                    CowStr::from(PIN_COLLECTION),
+                    CowStr::from(BLOCK_COLLECTION),
+                    CowStr::from(MOD_PERMISSION_COLLECTION),
+                    CowStr::from(BADGE_DEF_COLLECTION),
+                    CowStr::from(BADGE_ISSUANCE_COLLECTION),
+                    CowStr::from(EMOTE_PACK_COLLECTION),
+                    CowStr::from(EMOTE_ITEM_COLLECTION),
+                    CowStr::from(EMOTE_DELEGATION_COLLECTION),
                 ])
                 .build();
 
@@ -300,18 +365,34 @@ async fn handle_message(msg: RawJetstreamMessage<'static>, shared: &Arc<SharedSt
     let RawJetstreamMessage::Commit { did, commit, .. } = msg else {
         return;
     };
-    if !matches!(commit.operation, CommitOperation::Create) {
-        return;
-    }
     let collection = commit.collection.to_string();
     let Some(record) = commit.record else { return };
     let rkey = commit.rkey.to_string();
     let did_str = did.to_string();
-    match collection.as_str() {
-        COLLECTION => handle_chat_message(did_str, rkey, record, shared).await,
-        FOLLOW_COLLECTION => handle_follow(did_str, record, shared).await,
-        TELEPORT_COLLECTION => handle_teleport(did_str, record, shared).await,
-        _ => {}
+
+    match commit.operation {
+        CommitOperation::Create => match collection.as_str() {
+            COLLECTION => handle_chat_message(did_str, rkey, record, shared).await,
+            FOLLOW_COLLECTION => handle_follow(did_str, record, shared).await,
+            TELEPORT_COLLECTION => handle_teleport(did_str, record, shared).await,
+            CHAT_PROFILE_COLLECTION => handle_chat_profile(did_str, record, shared).await,
+            GATE_COLLECTION => handle_gate(did_str, record, shared).await,
+            PIN_COLLECTION => handle_pin(did_str, record, shared).await,
+            BLOCK_COLLECTION => handle_block(did_str, rkey, record, shared).await,
+            MOD_PERMISSION_COLLECTION => handle_mod_permission(did_str, record, shared).await,
+            BADGE_DEF_COLLECTION => handle_badge_def(rkey, record, shared).await,
+            BADGE_ISSUANCE_COLLECTION => handle_badge_issuance(did_str, record, shared).await,
+            EMOTE_PACK_COLLECTION => handle_emote_pack(did_str, rkey, record, shared).await,
+            EMOTE_ITEM_COLLECTION => handle_emote_item(did_str, rkey, record, shared).await,
+            EMOTE_DELEGATION_COLLECTION => handle_emote_delegation(did_str, record, shared).await,
+            _ => {}
+        },
+        CommitOperation::Delete => match collection.as_str() {
+            BLOCK_COLLECTION => handle_block_delete(did_str, rkey, shared).await,
+            MOD_PERMISSION_COLLECTION => handle_mod_permission_delete(did_str, rkey, shared).await,
+            _ => {}
+        },
+        CommitOperation::Update => {}
     }
 }
 
@@ -325,6 +406,87 @@ fn raw_to_usize(v: &RawData<'_>) -> Option<usize> {
         RawData::SignedInt(n) if *n >= 0 => Some(*n as usize),
         _ => None,
     }
+}
+
+fn parse_raw_color(obj: &BTreeMap<SmolStr, RawData<'_>>) -> Option<tweezer::ChatColor> {
+    let red = raw_to_usize(obj.get("red")?)? as u8;
+    let green = raw_to_usize(obj.get("green")?)? as u8;
+    let blue = raw_to_usize(obj.get("blue")?)? as u8;
+    Some(tweezer::ChatColor { red, green, blue })
+}
+
+fn parse_chat_profile(record: &RawData<'_>) -> Option<ChatProfile> {
+    let obj = record.as_object()?;
+    let color = obj.get("color").and_then(|c| c.as_object()).and_then(parse_raw_color);
+    let labels = obj
+        .get("selfLabels")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(ChatProfile {
+        color,
+        labels,
+        badges: Vec::new(),
+    })
+}
+
+fn parse_reply_ref(record: &RawData<'_>) -> Option<ReplyRef> {
+    let obj = record.as_object()?;
+    let reply = obj.get("reply")?.as_object()?;
+    let root = reply.get("root")?.as_object()?;
+    let parent = reply.get("parent")?.as_object()?;
+    let root_uri = root.get("uri")?.as_str()?.to_string();
+    let root_cid = root.get("cid")?.as_str()?.to_string();
+    let parent_uri = parent.get("uri")?.as_str()?.to_string();
+    let parent_cid = parent.get("cid")?.as_str()?.to_string();
+    Some(ReplyRef {
+        root_uri,
+        root_cid,
+        parent_uri,
+        parent_cid,
+    })
+}
+
+fn hydrate_user(did: &str, display_name: Option<String>, shared: &SharedState) -> User {
+    let (color, labels, badges) = shared
+        .chat_profiles
+        .read()
+        .ok()
+        .and_then(|profiles| profiles.get(did).cloned())
+        .map(|p| (p.color, p.labels, p.badges))
+        .unwrap_or_default();
+    User {
+        name: did.to_string(),
+        id: did.to_string(),
+        display_name,
+        color,
+        labels,
+        badges,
+    }
+}
+
+fn is_blocked(shared: &SharedState, streamer: &str, did: &str) -> bool {
+    shared
+        .streamer_states
+        .read()
+        .ok()
+        .and_then(|states| states.get(streamer).cloned())
+        .map(|s| s.blocked_dids.contains(did))
+        .unwrap_or(false)
+}
+
+fn is_moderator(shared: &SharedState, streamer: &str, did: &str) -> bool {
+    shared
+        .streamer_states
+        .read()
+        .ok()
+        .and_then(|states| states.get(streamer).cloned())
+        .map(|s| s.mod_dids.contains(did))
+        .unwrap_or(false)
 }
 
 fn parse_raw_facets(arr: &[RawData<'_>]) -> Vec<Facet> {
@@ -372,6 +534,10 @@ async fn handle_chat_message(did: String, rkey: String, record: RawData<'static>
         return;
     }
 
+    if is_blocked(shared, &streamer, &did) {
+        return;
+    }
+
     let mut text = match raw_str(&record, "text") {
         Some(t) => t.to_string(),
         None => return,
@@ -408,15 +574,19 @@ async fn handle_chat_message(did: String, rkey: String, record: RawData<'static>
     }
 
     let display_name = shared.user_cache.resolve_handle(&did).await;
+    let reply = parse_reply_ref(&record);
+    let is_streamer = did == streamer;
+    let is_moderator = is_moderator(shared, &streamer, &did);
+
     info!(did = %did, streamer = %streamer, text = %text, "received chat message");
     let xrpc = shared.xrpc.clone();
-    let user_cache = shared.user_cache.clone();
+    let shared_for_facets = Arc::clone(shared);
     let streamer_for_reply = streamer.clone();
 
     let (reply_tx, mut reply_rx) = mpsc::channel::<OutgoingMessage>(8);
     tokio::spawn(async move {
         while let Some(msg) = reply_rx.recv().await {
-            let facets = build_outgoing_facets(&msg.text, &user_cache).await;
+            let facets = build_outgoing_facets(&msg.text, &shared_for_facets).await;
             if let Err(e) = xrpc
                 .send_chat_message(&msg.text, &streamer_for_reply, facets)
                 .await
@@ -427,17 +597,13 @@ async fn handle_chat_message(did: String, rkey: String, record: RawData<'static>
     });
 
     let xrpc_for_delete = shared.xrpc.clone();
+    let xrpc_for_moderation = shared.xrpc.clone();
+    let streamer_for_moderation = streamer.clone();
+    let message_uri = format!("at://{did}/place.stream.chat.message/{rkey}");
     let event = tweezer::Event::Message(
         IncomingMessage::new(
             "streamplace",
-            User {
-                name: did.clone(),
-                id: did,
-                display_name,
-                color: None,
-                labels: Vec::new(),
-                badges: Vec::new(),
-            },
+            hydrate_user(&did, display_name, shared),
             text,
             streamer,
             reply_tx,
@@ -445,6 +611,9 @@ async fn handle_chat_message(did: String, rkey: String, record: RawData<'static>
         )
         .max_reply_graphemes(300)
         .message_id(&rkey)
+        .reply(reply)
+        .is_streamer(is_streamer)
+        .is_moderator(is_moderator)
         .on_delete(move || {
             let xrpc = xrpc_for_delete.clone();
             let rkey = rkey.clone();
@@ -452,6 +621,31 @@ async fn handle_chat_message(did: String, rkey: String, record: RawData<'static>
                 xrpc.delete_chat_message(&rkey)
                     .await
                     .map_err(|e| tweezer::TweezerError::Handler(e))
+            }
+        })
+        .on_moderate(move |action: ModerationAction| {
+            let xrpc = xrpc_for_moderation.clone();
+            let streamer = streamer_for_moderation.clone();
+            let message_uri = message_uri.clone();
+            async move {
+                match action {
+                    ModerationAction::HideMessage { .. } => {
+                        xrpc.create_gate(&streamer, &message_uri)
+                            .await
+                            .map_err(|e| tweezer::TweezerError::Handler(e))
+                    }
+                    ModerationAction::BanUser { user_did } => {
+                        xrpc.create_block(&streamer, &user_did)
+                            .await
+                            .map_err(|e| tweezer::TweezerError::Handler(e))
+                    }
+                    ModerationAction::PinMessage { message_uri, expires_at } => {
+                        xrpc.create_pin(&streamer, &message_uri, expires_at.as_deref())
+                            .await
+                            .map_err(|e| tweezer::TweezerError::Handler(e))
+                    }
+                    _ => Ok(()),
+                }
             }
         }),
     );
@@ -471,12 +665,12 @@ async fn handle_follow(did: String, record: RawData<'static>, shared: &Arc<Share
     info!(follower = %did, streamer = %subject, "follow event");
 
     let xrpc = shared.xrpc.clone();
-    let user_cache = shared.user_cache.clone();
+    let shared_for_facets = Arc::clone(shared);
     let subject_for_reply = subject.clone();
     let (reply_tx, mut reply_rx) = mpsc::channel::<OutgoingMessage>(8);
     tokio::spawn(async move {
         while let Some(msg) = reply_rx.recv().await {
-            let facets = build_outgoing_facets(&msg.text, &user_cache).await;
+            let facets = build_outgoing_facets(&msg.text, &shared_for_facets).await;
             if let Err(e) = xrpc
                 .send_chat_message(&msg.text, &subject_for_reply, facets)
                 .await
@@ -490,14 +684,7 @@ async fn handle_follow(did: String, record: RawData<'static>, shared: &Arc<Share
         "streamplace",
         subject,
         TriggerKind::Follow {
-            user: User {
-                name: did.clone(),
-                id: did,
-                display_name,
-                color: None,
-                labels: Vec::new(),
-                badges: Vec::new(),
-            },
+            user: hydrate_user(&did, display_name, shared),
         },
         reply_tx,
         Arc::new(|name| format!(":{}:", name)),
@@ -517,12 +704,12 @@ async fn handle_teleport(did: String, record: RawData<'static>, shared: &Arc<Sha
     info!(raider = %did, streamer = %streamer, "teleport/raid event");
 
     let xrpc = shared.xrpc.clone();
-    let user_cache = shared.user_cache.clone();
+    let shared_for_facets = Arc::clone(shared);
     let streamer_for_reply = streamer.clone();
     let (reply_tx, mut reply_rx) = mpsc::channel::<OutgoingMessage>(8);
     tokio::spawn(async move {
         while let Some(msg) = reply_rx.recv().await {
-            let facets = build_outgoing_facets(&msg.text, &user_cache).await;
+            let facets = build_outgoing_facets(&msg.text, &shared_for_facets).await;
             if let Err(e) = xrpc
                 .send_chat_message(&msg.text, &streamer_for_reply, facets)
                 .await
@@ -545,13 +732,254 @@ async fn handle_teleport(did: String, record: RawData<'static>, shared: &Arc<Sha
     shared.bot_tx.send(event).await.ok();
 }
 
-async fn build_outgoing_facets(text: &str, cache: &UserCache) -> Option<Vec<OutgoingFacet>> {
-    let scanned = scan_text_facets(text);
-    if scanned.is_empty() {
-        return None;
+async fn handle_chat_profile(did: String, record: RawData<'static>, shared: &Arc<SharedState>) {
+    let Some(profile) = parse_chat_profile(&record) else {
+        return;
+    };
+    if let Ok(mut profiles) = shared.chat_profiles.write() {
+        profiles.insert(did, profile);
+    }
+}
+
+async fn handle_gate(did: String, record: RawData<'static>, shared: &Arc<SharedState>) {
+    let hidden_message = match raw_str(&record, "hiddenMessage") {
+        Some(s) => s.to_string(),
+        None => return,
+    };
+    let streamer = did;
+    if !shared.streamers.contains(&streamer) {
+        return;
+    }
+    info!(message = %hidden_message, "message hidden");
+    let event = tweezer::Event::Trigger(TriggerEvent::new(
+        "streamplace",
+        streamer.clone(),
+        TriggerKind::MessageHidden {
+            message_uri: hidden_message,
+            hidden_by: streamer,
+        },
+        mpsc::channel(1).0,
+        shared.emote_fn.clone(),
+    ));
+    shared.bot_tx.send(event).await.ok();
+}
+
+async fn handle_pin(did: String, record: RawData<'static>, shared: &Arc<SharedState>) {
+    let pinned_message = match raw_str(&record, "pinnedMessage") {
+        Some(s) => s.to_string(),
+        None => return,
+    };
+    let pinned_by = raw_str(&record, "pinnedBy").unwrap_or(&did).to_string();
+    let expires_at = raw_str(&record, "expiresAt").map(|s| s.to_string());
+    let streamer = did;
+    if !shared.streamers.contains(&streamer) {
+        return;
+    }
+    info!(message = %pinned_message, "message pinned");
+    let event = tweezer::Event::Trigger(TriggerEvent::new(
+        "streamplace",
+        streamer,
+        TriggerKind::MessagePinned {
+            message_uri: pinned_message,
+            pinned_by,
+            expires_at,
+        },
+        mpsc::channel(1).0,
+        shared.emote_fn.clone(),
+    ));
+    shared.bot_tx.send(event).await.ok();
+}
+
+async fn handle_block(
+    did: String,
+    _rkey: String,
+    record: RawData<'static>,
+    shared: &Arc<SharedState>,
+) {
+    let subject = match raw_str(&record, "subject") {
+        Some(s) => s.to_string(),
+        None => return,
+    };
+    let streamer = did;
+    if !shared.streamers.contains(&streamer) {
+        return;
+    }
+    if let Ok(mut states) = shared.streamer_states.write() {
+        states
+            .entry(streamer.clone())
+            .or_default()
+            .blocked_dids
+            .insert(subject.clone());
+    }
+    let display_name = shared.user_cache.resolve_handle(&subject).await;
+    let event = tweezer::Event::Trigger(TriggerEvent::new(
+        "streamplace",
+        streamer.clone(),
+        TriggerKind::UserBanned {
+            user: hydrate_user(&subject, display_name, shared),
+            banned_by: streamer.clone(),
+        },
+        mpsc::channel(1).0,
+        shared.emote_fn.clone(),
+    ));
+    shared.bot_tx.send(event).await.ok();
+}
+
+async fn handle_block_delete(did: String, _rkey: String, shared: &Arc<SharedState>) {
+    let streamer = did.clone();
+    if !shared.streamers.contains(&streamer) {
+        return;
+    }
+    // We don't know the subject from the delete tombstone alone,
+    // so we emit an unbanned trigger without the user DID.
+    let event = tweezer::Event::Trigger(TriggerEvent::new(
+        "streamplace",
+        streamer.clone(),
+        TriggerKind::UserUnbanned {
+            user_did: String::new(),
+            unbanned_by: streamer,
+        },
+        mpsc::channel(1).0,
+        shared.emote_fn.clone(),
+    ));
+    shared.bot_tx.send(event).await.ok();
+}
+
+async fn handle_mod_permission(did: String, record: RawData<'static>, shared: &Arc<SharedState>) {
+    let moderator = match raw_str(&record, "moderator") {
+        Some(s) => s.to_string(),
+        None => return,
+    };
+    let streamer = did;
+    if !shared.streamers.contains(&streamer) {
+        return;
+    }
+    if let Ok(mut states) = shared.streamer_states.write() {
+        states
+            .entry(streamer)
+            .or_default()
+            .mod_dids
+            .insert(moderator);
+    }
+}
+
+async fn handle_mod_permission_delete(
+    did: String,
+    _rkey: String,
+    shared: &Arc<SharedState>,
+) {
+    let streamer = did;
+    if !shared.streamers.contains(&streamer) {
+        return;
+    }
+    // Without the full record we can't know which mod was removed,
+    // so we clear all mod permissions and let them be rebuilt from firehose.
+    if let Ok(mut states) = shared.streamer_states.write() {
+        if let Some(state) = states.get_mut(&streamer) {
+            state.mod_dids.clear();
+        }
+    }
+}
+
+async fn handle_badge_def(_rkey: String, _record: RawData<'static>, _shared: &Arc<SharedState>) {
+    // TODO: Index badge definitions for hydration.
+}
+
+async fn handle_badge_issuance(
+    _did: String,
+    _record: RawData<'static>,
+    _shared: &Arc<SharedState>,
+) {
+    // TODO: Index badge issuances for user hydration.
+}
+
+async fn handle_emote_pack(
+    _did: String,
+    _rkey: String,
+    _record: RawData<'static>,
+    _shared: &Arc<SharedState>,
+) {
+    // TODO: Index emote packs.
+}
+
+async fn handle_emote_item(
+    did: String,
+    rkey: String,
+    record: RawData<'static>,
+    shared: &Arc<SharedState>,
+) {
+    let name = match raw_str(&record, "name") {
+        Some(s) => s.to_string(),
+        None => return,
+    };
+    let pack_uri = raw_str(&record, "pack").unwrap_or("").to_string();
+    let alt = raw_str(&record, "alt").unwrap_or("").to_string();
+
+    let image_cid = record
+        .as_object()
+        .and_then(|obj| obj.get("image"))
+        .and_then(|img| img.as_object())
+        .and_then(|img| img.get("ref"))
+        .and_then(|r#ref| r#ref.as_object())
+        .and_then(|r#ref| r#ref.get("$link"))
+        .and_then(|link| link.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+
+    let uri = format!("at://{did}/place.stream.emote.item/{rkey}");
+    let item = EmoteItem {
+        name,
+        pack_uri,
+        image_cid,
+        alt,
+    };
+    if let Ok(mut items) = shared.emote_items.write() {
+        items.insert(uri, item);
+    }
+}
+
+async fn handle_emote_delegation(
+    _did: String,
+    _record: RawData<'static>,
+    _shared: &Arc<SharedState>,
+) {
+    // TODO: Index emote pack delegations.
+}
+
+fn scan_emote_facets(text: &str) -> Vec<(usize, usize, String)> {
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut facets = Vec::new();
+    let mut i = 0;
+
+    while i < len {
+        if bytes[i] == b':' {
+            let start = i;
+            let mut j = i + 1;
+            while j < len && bytes[j] != b':' && !bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < len && bytes[j] == b':' && j > start + 1 {
+                let name = &text[start + 1..j];
+                if name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
+                    facets.push((start, j + 1, name.to_string()));
+                    i = j + 1;
+                    continue;
+                }
+            }
+        }
+        i += 1;
     }
 
-    let mut facets = Vec::with_capacity(scanned.len());
+    facets
+}
+
+async fn build_outgoing_facets(text: &str, shared: &SharedState) -> Option<Vec<OutgoingFacet>> {
+    let scanned = scan_text_facets(text);
+    let emote_scanned = scan_emote_facets(text);
+
+    let mut facets = Vec::with_capacity(scanned.len() + emote_scanned.len());
+
     for s in scanned {
         match s {
             ScannedFacet::Mention {
@@ -559,7 +987,7 @@ async fn build_outgoing_facets(text: &str, cache: &UserCache) -> Option<Vec<Outg
                 byte_end,
                 handle,
             } => {
-                if let Some(did) = cache.resolve_did(&handle).await {
+                if let Some(did) = shared.user_cache.resolve_did(&handle).await {
                     facets.push(OutgoingFacet::mention(byte_start, byte_end, did));
                 }
             }
@@ -577,6 +1005,17 @@ async fn build_outgoing_facets(text: &str, cache: &UserCache) -> Option<Vec<Outg
                 let domain = &text[byte_start..byte_end];
                 let url = format!("https://{}", domain);
                 facets.push(OutgoingFacet::link(byte_start, byte_end, url));
+            }
+        }
+    }
+
+    if !emote_scanned.is_empty() {
+        let items = shared.emote_items.read().ok()?;
+        for (start, end, name) in emote_scanned {
+            // Find an emote item with this name.
+            // TODO: validate access rights (pack delegation, openInMyChat).
+            if let Some((uri, _item)) = items.iter().find(|(_, item)| item.name == name) {
+                facets.push(OutgoingFacet::emote(start, end, uri.clone()));
             }
         }
     }

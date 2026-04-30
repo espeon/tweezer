@@ -1157,6 +1157,7 @@ impl Bot {
                 )
                 .with_message_id(msg.message_id)
                 .with_delete(msg.delete_fn)
+                .with_moderation(msg.moderation_fn)
                 .with_reply(msg.reply)
                 .with_streamer(msg.is_streamer)
                 .with_moderator(msg.is_moderator);
@@ -1394,6 +1395,7 @@ mod tests {
             max_reply_graphemes: None,
             message_id: None,
             delete_fn: None,
+            moderation_fn: None,
             reply: None,
             is_streamer: false,
             is_moderator: false,
@@ -2670,6 +2672,7 @@ mod tests {
             max_reply_graphemes: None,
             message_id: None,
             delete_fn: None,
+            moderation_fn: None,
             reply: None,
             is_streamer: false,
             is_moderator: false,
@@ -2969,6 +2972,7 @@ mod tests {
             max_reply_graphemes: None,
             message_id: None,
             delete_fn: None,
+            moderation_fn: None,
             reply: None,
             is_streamer: false,
             is_moderator: false,
